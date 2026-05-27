@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Module version for a manual/dry-run build, e.g. 0.1.0 (no leading v). Ignored on tag-push.'
+        required: true
+        default: '0.1.0'
       dry_run:
         # Defaults ON for safety — workflow_dispatch with default inputs must
         # NOT cut a GH Release. Operator must explicitly uncheck the box in the
@@ -99,8 +103,19 @@ jobs:
         # 1.31.1) so debian/prepare.sh receives a clean upstream version.
         env:
           MODULE_REF: ${{ github.ref_name }}
+          VERSION_IN: ${{ inputs.version }}
         run: |
-          MODULE_VERSION="${MODULE_REF#v}"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              MODULE_VERSION="${MODULE_REF#v}"
+          else
+              MODULE_VERSION="${VERSION_IN#v}"
+          fi
+          # dch / dpkg require a digit-leading upstream version; guard both paths
+          # (the push path is also format-checked by the Validate tag step above).
+          if ! printf '%s' "$MODULE_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+~][a-zA-Z0-9.+~]+)?$'; then
+              echo "release.yml: version must be N.N.N[+~suffix], got: ${MODULE_VERSION}" >&2
+              exit 1
+          fi
           NGINX_VERSION=$(dpkg-query -W -f='${Version}' nginx | sed 's/-.*//')
           {
               echo "MODULE_VERSION=$MODULE_VERSION"
@@ -154,9 +169,15 @@ jobs:
         id: ver
         env:
           MODULE_REF: ${{ github.ref_name }}
+          VERSION_IN: ${{ inputs.version }}
         run: |
-          echo "tag=$MODULE_REF" >> "$GITHUB_OUTPUT"
-          echo "name=$MODULE_REF" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              TAG="$MODULE_REF"
+          else
+              TAG="v${VERSION_IN#v}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Download .deb artefacts
         uses: actions/download-artifact@v4
