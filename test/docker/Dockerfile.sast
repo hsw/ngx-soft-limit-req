@@ -1,0 +1,78 @@
+# Dockerfile.sast — static analysis image for ngx_http_soft_limit_req_module.
+#
+# Bundles five SAST tools and an nginx source tree so they have the include
+# paths they need to analyse our single module .c file:
+#   * scan-build (Clang Static Analyzer)
+#   * clang-tidy (clang-analyzer + bugprone + cert checks)
+#   * cppcheck
+#   * gcc -fanalyzer
+#   * flawfinder
+#
+# Run all tools:     docker run --rm -v "$PWD/tmp/sast-results:/work/sast-results" soft-limit-req-sast
+# Run a single tool: docker run --rm -v "$PWD/tmp/sast-results:/work/sast-results" soft-limit-req-sast cppcheck
+#
+# The driver `test/sast.sh` builds this image and runs it for you. Results land
+# under `tmp/sast-results/<tool>.log` on the host.
+#
+# Module target: /work/module/src/ngx_http_soft_limit_req_module.c
+#
+# nginx is pinned to the same mainline source the runtime harness uses
+# (NGINX_VERSION), fetched directly from nginx.org.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pin nginx to the same version the runtime harness builds against.
+ARG NGINX_VERSION=1.31.1
+
+RUN apt-get update && apt-get install -y \
+        clang-18 \
+        clang-tools-18 \
+        clang-tidy-18 \
+        gcc \
+        bear \
+        cppcheck \
+        python3-pip \
+        libpcre2-dev libssl-dev zlib1g-dev \
+        make \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/clang-18 /usr/local/bin/clang \
+    && ln -s /usr/bin/clang++-18 /usr/local/bin/clang++ \
+    && ln -s /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy \
+    && ln -s /usr/bin/scan-build-18 /usr/local/bin/scan-build \
+    && pip install --break-system-packages flawfinder
+
+RUN curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /work \
+ && tar -C /work -xzf /tmp/nginx.tar.gz \
+ && ln -s "/work/nginx-${NGINX_VERSION}" /work/nginx \
+ && rm -f /tmp/nginx.tar.gz
+
+RUN mkdir -p /work/sast-results
+
+WORKDIR /work
+
+# Module source. A single --add-module=/work/module is the supported entry
+# point — the top-level `config` wires src/ via $ngx_addon_dir.
+COPY config /work/module/config
+COPY src /work/module/src
+
+# Configure nginx (clang); bear captures compile_commands.json for clang-tidy.
+# --with-compat keeps configure permissive (no platform-specific assumptions).
+RUN cd /work/nginx && \
+    ./configure \
+      --with-cc=clang \
+      --with-cc-opt="-Wno-error" \
+      --with-compat \
+      --add-module=/work/module \
+      2>&1 | tail -20 && \
+    bear -- make -j"$(nproc)" 2>&1 | tail -10 && \
+    echo "compile_commands.json entries: $(grep -c '\"file\"' compile_commands.json || echo 0)"
+
+COPY test/docker/run-sast.sh /usr/local/bin/run-sast
+RUN chmod +x /usr/local/bin/run-sast
+
+ENTRYPOINT ["/usr/local/bin/run-sast"]
+CMD ["all"]

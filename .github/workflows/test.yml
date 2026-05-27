@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Inlined actionlint (fast-fails the workflow YAML before the docker
+      # build). Install logic + SHA256-pinned download in t/ci helper.
+      - name: Install actionlint
+        id: install_actionlint
+        run: echo "actionlint=$(bash test/ci/install-actionlint.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Run actionlint
+        run: ${{ steps.install_actionlint.outputs.actionlint }} .github/workflows/*.yml
+
+      # Builds nginx (pinned NGINX_VERSION) + the module in Docker and runs the
+      # full integration suite (5 harness checks + 11 behaviour cases).
+      #
+      # SAST / ASan / UBSan / Valgrind / coverage are intentionally NOT gated
+      # here — they are manual local Docker tools (test/sast.sh, test/asan.sh,
+      # test/valgrind.sh, test/coverage.sh), kept out of CI to keep it fast.
+      - name: Run integration suite
+        run: ./test/run.sh

@@ -1,0 +1,35 @@
+# Local working scratch — not part of the published module.
+# docs/      = local design / working notes (not shipped)
+# reference/ = upstream nginx source kept locally as a fork reference
+# tmp/       = scratch, downloaded sources, and test result logs
+docs/
+reference/
+tmp/
+
+# Downloaded build sources fetched by the test harness
+nginx-*/
+build/
+
+# nginx/C build artifacts
+objs/
+*.o
+*.so
+*.lo
+*.la
+Makefile
+
+# Test harness runtime
+test/logs/
+test/*.pid
+*.core
+core.*
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Dropbox conflicted copies (this tree lives under Dropbox)
+*conflicted copy*

@@ -1,0 +1,63 @@
+# Parallel audit run: 5 SAST tools, one container per service.
+#
+# Usage (from repo root):
+#   docker compose -f test/docker/docker-compose.sast.yml up --build
+#   docker compose -f test/docker/docker-compose.sast.yml run --rm summary
+#
+# Or via the host driver:
+#   bash test/sast.sh              # all 5 SAST tools in parallel, then summary
+#   bash test/sast.sh sast         # alias for the above
+#   bash test/sast.sh cppcheck     # a single SAST tool
+#   bash test/sast.sh summary      # re-print saved SAST summary
+#
+# Results land in tmp/sast-results/ on the host.
+#
+# Valgrind is NOT a compose service: our regression cases are HOST-driven over
+# HTTP (they cannot run inside a compose container), so valgrind runs via its
+# own host driver — `bash test/valgrind.sh` — which boots the
+# Dockerfile.valgrind image and drives the cases from the host. The ASan and
+# coverage layers are likewise host-driven (test/asan.sh, test/coverage.sh).
+#
+# Parallelism is safe: each container gets its own writable copy-on-write layer;
+# scan-build and gcc-fanalyzer rebuild nginx in isolation.
+
+x-sast-base: &sast-base
+  image: soft-limit-req-sast:latest
+  build:
+    context: ../..
+    dockerfile: test/docker/Dockerfile.sast
+  volumes:
+    - ../../tmp/sast-results:/work/sast-results
+
+services:
+  scan-build:
+    <<: *sast-base
+    container_name: sast-scan-build
+    command: ["scan-build"]
+
+  clang-tidy:
+    <<: *sast-base
+    container_name: sast-clang-tidy
+    command: ["clang-tidy"]
+
+  cppcheck:
+    <<: *sast-base
+    container_name: sast-cppcheck
+    command: ["cppcheck"]
+
+  gcc-fanalyzer:
+    <<: *sast-base
+    container_name: sast-gcc-fanalyzer
+    command: ["gcc-fanalyzer"]
+
+  flawfinder:
+    <<: *sast-base
+    container_name: sast-flawfinder
+    command: ["flawfinder"]
+
+  # Manual: `docker compose ... run --rm summary` after a parallel run completes.
+  summary:
+    <<: *sast-base
+    container_name: sast-summary
+    profiles: ["manual"]
+    command: ["summary"]

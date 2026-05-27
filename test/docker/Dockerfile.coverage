@@ -1,0 +1,102 @@
+# Dockerfile.coverage — gcov-instrumented nginx + our module build.
+#
+# Static build with `-fprofile-arcs -ftest-coverage` so every executed
+# line/branch in src/ngx_http_soft_limit_req_module.c is recorded in .gcda
+# files at worker exit. test/coverage.sh runs the regression cases against the
+# container, then invokes gcov in-container and surfaces line/branch coverage %
+# plus the uncovered lines.
+#
+# Design notes:
+#   * -O0 : gcov branch-coverage accuracy collapses under -O1+ (the compiler
+#     elides/rewrites arcs). Optimised builds underreport.
+#   * Static build (--add-module, NOT --add-dynamic-module): keeps the .gcno
+#     (compile-time block graph) and .gcda (run-time counts) together under
+#     objs/addon/src/ where gcov can find them. A dynamic .so scatters them.
+#   * `nginx -s quit` calls exit() in the worker, triggering __gcov_exit()
+#     which flushes .gcda. SIGKILL would skip the flush — the driver always
+#     shuts down gracefully.
+#
+# Adapted to OUR harness: nginx pinned + fetched from nginx.org (NGINX_VERSION
+# ARG), serves OUR test/conf/nginx.conf (load_module line stripped). Driven by
+# test/coverage.sh from the host.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pinned nginx source version — same default as test/Dockerfile.
+ARG NGINX_VERSION=1.31.1
+
+# gcc + lcov/gcov; the rest mirror test/Dockerfile's build deps.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gcc make libc-dev \
+        lcov \
+        libpcre2-dev zlib1g-dev libssl-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Module sources copied into /src (the addon dir referenced by `config`).
+COPY config /src/config
+COPY src /src/src
+
+# Fetch and unpack the pinned nginx source.
+RUN set -eux; \
+    mkdir -p /usr/local/src/nginx; \
+    curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+        -o /tmp/nginx.tar.gz; \
+    tar -xzf /tmp/nginx.tar.gz -C /usr/local/src/nginx --strip-components=1; \
+    rm /tmp/nginx.tar.gz
+
+# Instrumented static build. The .gcno (compile-time) and .gcda (run-time)
+# files for --add-module=/src land under objs/addon/src/.
+#   -O0 -g : accurate branch coverage + readable.
+#   -fprofile-arcs -ftest-coverage : gcov instrumentation.
+#   -DNGX_DEBUG_PALLOC=1 : keep parity with the other instrumented builds.
+#   --with-ld-opt="-lgcov" : link the gcov runtime.
+#   -Wno-error : addon/core warnings must not abort the build.
+#
+# --with-compat + --with-http_realip_module are MANDATORY (OUR config uses
+# set_real_ip_from / real_ip_header). proxy is core.
+WORKDIR /usr/local/src/nginx
+RUN set -eux; \
+    ./configure \
+        --prefix=/etc/nginx \
+        --sbin-path=/usr/sbin/nginx \
+        --conf-path=/etc/nginx/nginx.conf \
+        --pid-path=/run/nginx.pid \
+        --error-log-path=/var/log/nginx/error.log \
+        --http-log-path=/var/log/nginx/access.log \
+        --modules-path=/usr/lib/nginx/modules \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --with-cc-opt="-O0 -g -fprofile-arcs -ftest-coverage -DNGX_DEBUG_PALLOC=1 -Wno-error" \
+        --with-ld-opt="-lgcov" \
+        --add-module=/src; \
+    make -j"$(nproc)"; \
+    make install; \
+    /usr/sbin/nginx -V 2>&1; \
+    mkdir -p /var/log/nginx
+
+# Static content root for the soft-limited locations (same as test/Dockerfile).
+RUN set -eux; \
+    mkdir -p /usr/share/test-html; \
+    printf 'ok\n' > /usr/share/test-html/ok.txt
+
+# Install OUR test config with the load_module line STRIPPED (module is built-in
+# for a static build — see Dockerfile.asan for the full rationale).
+COPY test/conf/nginx.conf /tmp/nginx.conf.in
+RUN sed '/load_module .*ngx_http_soft_limit_req_module/d' /tmp/nginx.conf.in \
+        > /etc/nginx/nginx.conf
+
+# The .gcno files were placed in objs/addon/src/ at compile time. Make the objs
+# tree world-writable so the unprivileged nginx worker (nobody) can dump .gcda
+# files there at exit.
+RUN chmod -R 0777 /usr/local/src/nginx/objs
+
+EXPOSE 80
+STOPSIGNAL SIGQUIT
+# test/coverage.sh overrides the entrypoint with `sleep infinity` and drives
+# everything via docker exec; this CMD applies only to ad-hoc `docker run`.
+CMD ["nginx", "-g", "daemon off;"]

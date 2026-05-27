@@ -1,0 +1,146 @@
+# Dockerfile.asan — AddressSanitizer + UndefinedBehaviorSanitizer variant for
+# ngx_http_soft_limit_req_module.
+#
+# Builds nginx + our module STATICALLY with Clang and
+# `-fsanitize=address,undefined`. Catches, in OUR module's hot path:
+#   * heap buffer overflow / use-after-free / double-free            (ASan)
+#   * signed-integer overflow, shift-overflow, null deref            (UBSan)
+#   * out-of-bounds reads on the slab-backed rbtree nodes / key copy (ASan)
+#
+# Static build (--add-module, NOT --add-dynamic-module) so the sanitizer
+# runtime is linked directly into the nginx binary. A dynamic .so loaded into
+# a non-instrumented host nginx doesn't work cleanly (the host binary lacks the
+# ASan runtime; LD_PRELOAD of the runtime is fragile). Adapted to OUR harness:
+#   * nginx pinned + fetched from nginx.org directly (NGINX_VERSION ARG), the
+#     same idiom as test/Dockerfile and test/docker/Dockerfile.sast.
+#   * serves OUR test/conf/nginx.conf (load_module line stripped — see below).
+#   * the host driver test/asan.sh boots a container and runs a curated subset
+#     of test/cases/*.sh against it over HTTP.
+#
+# Usage (via the host driver):
+#   bash test/asan.sh
+#
+# Sanitizer findings are written to per-pid FILES under /tmp/sanlog (see the
+# log_path in ASAN_OPTIONS/UBSAN_OPTIONS below) so they survive nginx's
+# stderr->error_log redirect; the driver cats them out and gates on them.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pinned nginx source version — same default as test/Dockerfile so the
+# instrumented build matches the runtime harness. Override with
+# --build-arg NGINX_VERSION=...
+ARG NGINX_VERSION=1.31.1
+
+# clang/lld-18 for the sanitizer toolchain; libclang-rt-18-dev ships the
+# compiler-rt sanitizer runtime archives (libclang_rt.asan-*.a etc.) WITHOUT
+# which `-fsanitize=address,undefined` link probes fail at configure time
+# ("cannot open libclang_rt.asan_static-<arch>.a"). The rest mirror
+# test/Dockerfile's build deps (pcre2/zlib/ssl for nginx core + our config's
+# realip/ssl needs).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl make libc-dev \
+        clang-18 lld-18 libclang-rt-18-dev \
+        libpcre2-dev zlib1g-dev libssl-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -s /usr/bin/clang-18   /usr/local/bin/clang; \
+    ln -s /usr/bin/clang++-18 /usr/local/bin/clang++; \
+    ln -s /usr/bin/ld.lld-18  /usr/local/bin/ld.lld
+
+# Module sources copied into /src (the addon dir referenced by `config`).
+COPY config /src/config
+COPY src /src/src
+
+# Fetch and unpack the pinned nginx source.
+RUN set -eux; \
+    mkdir -p /usr/src/nginx; \
+    curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+        -o /tmp/nginx.tar.gz; \
+    tar -xzf /tmp/nginx.tar.gz -C /usr/src/nginx --strip-components=1; \
+    rm /tmp/nginx.tar.gz
+
+# Build nginx + our module with ASan + UBSan.
+#
+#   -fno-sanitize=alignment : nginx core does intentionally-unaligned reads
+#       (ngx_string.c word-at-a-time scans) that UBSan flags as UB but are safe
+#       on x86_64/arm64. Without this every request would drown the log in
+#       core-only alignment noise.
+#   -DNGX_DEBUG_PALLOC=1 : routes every ngx_palloc_small() through ngx_alloc()
+#       so EACH pool allocation gets its own ASan redzone. Without it ASan only
+#       red-zones the parent pool block, and overflows inside individual
+#       pool-allocated buffers (our key copy, the rbtree node) are invisible.
+#   -fno-omit-frame-pointer -g : usable stack traces.
+#   -Wno-error : nginx + addon warnings under clang must not abort the build.
+#
+# ASAN_OPTIONS=detect_leaks=0 is prefixed for the configure step: nginx's
+# auto/feature probes compile and RUN tiny binaries; a leak in such a probe
+# under LSan would make the probe exit nonzero and mislead configure. Detection
+# only — the runtime ENV below re-tunes leak handling.
+#
+# --with-compat + --with-http_realip_module are MANDATORY: OUR test config uses
+# set_real_ip_from / real_ip_header, so without realip `nginx -t` fails and
+# nothing boots. proxy is core (always built).
+WORKDIR /usr/src/nginx
+RUN set -eux; \
+    ASAN_OPTIONS=detect_leaks=0 \
+    ./configure \
+        --prefix=/etc/nginx \
+        --sbin-path=/usr/sbin/nginx \
+        --conf-path=/etc/nginx/nginx.conf \
+        --pid-path=/run/nginx.pid \
+        --error-log-path=/var/log/nginx/error.log \
+        --http-log-path=/var/log/nginx/access.log \
+        --modules-path=/usr/lib/nginx/modules \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --with-cc=clang \
+        --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=alignment -DNGX_DEBUG_PALLOC=1 -Wno-error" \
+        --with-ld-opt="-fsanitize=address,undefined -fuse-ld=lld" \
+        --add-module=/src; \
+    make -j"$(nproc)"; \
+    make install; \
+    /usr/sbin/nginx -V 2>&1; \
+    mkdir -p /var/log/nginx
+
+# Static content root for the soft-limited locations (same as test/Dockerfile):
+# serving a real file routes requests through the content phase (after
+# PREACCESS), so the soft_limit_req handler actually runs.
+RUN set -eux; \
+    mkdir -p /usr/share/test-html; \
+    printf 'ok\n' > /usr/share/test-html/ok.txt
+
+# Install OUR test config with the load_module line STRIPPED. The module is
+# built-in for a static build, so a `load_module .../...so;` line would make
+# nginx fail to start ("module ... is not binary compatible" / missing file).
+COPY test/conf/nginx.conf /tmp/nginx.conf.in
+RUN sed '/load_module .*ngx_http_soft_limit_req_module/d' /tmp/nginx.conf.in \
+        > /etc/nginx/nginx.conf
+
+# Sanitizer findings -> per-pid FILES under /tmp/sanlog via log_path. nginx
+# redirects worker stderr into the error_log very early, so any finding printed
+# to stderr would be swallowed; log_path makes ASan/UBSan write directly to
+# files the driver can collect. World-writable because nginx workers run as the
+# unprivileged `nobody` user and must be able to create the per-pid files.
+#
+#   detect_leaks=0            : nginx allocates startup pools (cycle/log) it
+#                               never explicitly frees — the standard "free on
+#                               process exit" pattern, not a bug. (Real per-
+#                               request leaks are caught by the valgrind layer.)
+#   abort_on_error=0          : a finding must NOT crash the worker; we want the
+#       halt_on_error=0         server to keep serving so the case finishes and
+#                               the file is fully written. The driver gates on
+#                               the file content, not on the exit code.
+#   print_stacktrace=1        : symbolised frames so we can tell our module from
+#                               nginx core when filtering UBSan noise.
+#   strict_string_checks=1 / check_initialization_order=1 : tighter ASan.
+RUN mkdir -p /tmp/sanlog && chmod 0777 /tmp/sanlog
+ENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=0:halt_on_error=0:log_path=/tmp/sanlog/asan:print_stacktrace=1:strict_string_checks=1:check_initialization_order=1
+ENV UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0:abort_on_error=0:log_path=/tmp/sanlog/ubsan
+
+EXPOSE 80
+STOPSIGNAL SIGQUIT
+CMD ["nginx", "-g", "daemon off;"]

@@ -1,0 +1,78 @@
+# valgrind.supp — Valgrind suppressions for the in-container nginx + our module.
+#
+# Filters out the standard "free everything when the process dies" nginx-CORE
+# init-pool allocations that are not defects but show up as `definitely lost`.
+# Every stanza is anchored on nginx-core frames (ngx_create_pool / main /
+# ngx_event_process_init / ngx_set_environment) — NONE wildcard over our module
+# (ngx_http_soft_limit_req_module), so a real leak in our code is never hidden.
+#
+# Suppresses nginx-core startup-pool noise (the same pattern applies to any
+# add-on module); curated against the
+# tmp/valgrind-logs/raw/*.log output of a test/valgrind.sh run on THIS image
+# (gcc -O0 -g, ubuntu 24.04 glibc, bundled valgrind). Add new stanzas only for
+# nginx-core noise observed firing — never broad wildcards.
+
+# Init cycle pool — allocated at startup (main -> ngx_init_cycle) and never
+# freed because nginx assumes process-exit reclaims OS memory.
+{
+   nginx_init_cycle_pool_create_main
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:posix_memalign
+   fun:ngx_memalign
+   fun:ngx_create_pool
+   fun:ngx_init_cycle
+   fun:main
+}
+
+# Bootstrap log/conf pool — allocated by main() directly before ngx_init_cycle
+# takes over. Distinct from the cycle pool; same "free on process exit" pattern.
+{
+   nginx_bootstrap_pool_create_main
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:posix_memalign
+   fun:ngx_memalign
+   fun:ngx_create_pool
+   fun:main
+}
+
+# Worker init: posted-event queue allocations kept alive for the process
+# lifetime. ngx_event_process_init is nginx-core, not our module.
+{
+   nginx_event_process_init_alloc
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+   ...
+}
+
+# Environment strdup at worker setup, kept for the process lifetime.
+{
+   nginx_set_environment_alloc
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_set_environment
+   ...
+}
+
+# CRC32 lookup table — allocated once in main() (nginx.c:275 ->
+# ngx_crc32_table_init -> ngx_alloc) and kept in a global for the process
+# lifetime; never freed (process-exit reclaims it). Valgrind flags it
+# "possibly lost" because the live pointers into it are interior-aligned.
+# Observed firing in EVERY per-pid log (master + each worker) of a
+# test/valgrind.sh run on THIS image; 128 bytes, identical stack each time.
+# nginx-CORE, not our module. Tightly anchored on ngx_crc32_table_init/main.
+{
+   nginx_crc32_table_init_main
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_crc32_table_init
+   fun:main
+}

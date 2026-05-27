@@ -1,0 +1,109 @@
+# Dockerfile.valgrind — Valgrind memcheck variant for
+# ngx_http_soft_limit_req_module.
+#
+# Builds nginx + our module STATICALLY with gcc and `-O0 -g
+# -fno-omit-frame-pointer` so valgrind sees our module's symbols directly in the
+# main binary (no dlopen indirection) and reports per-request leaks / invalid
+# accesses with readable frames. Catches:
+#   * definite/indirect leaks in the rbtree-node / key-copy slab path
+#   * invalid reads/writes and uninitialised-value use in the handler
+#
+# Static build (--add-module, NOT --add-dynamic-module): a dynamic .so would
+# hide module symbols behind dlopen and make leak attribution harder.
+#
+# Adapted to OUR harness: nginx is pinned and fetched from nginx.org
+# (NGINX_VERSION ARG, same as test/Dockerfile), and
+# it serves OUR test/conf/nginx.conf (load_module line stripped). Because our
+# cases are HOST-driven over HTTP (they can't run inside the container), this
+# image is driven by test/valgrind.sh, NOT by docker-compose: the driver boots
+# the container with a sleep entrypoint, wraps nginx under a valgrind shim,
+# starts nginx daemon-on, runs a small pure-HTTP case subset from the host,
+# then `nginx -s quit` flushes per-pid valgrind logs which the driver collects.
+#
+# Usage (via the host driver):
+#   bash test/valgrind.sh
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pinned nginx source version — same default as test/Dockerfile.
+ARG NGINX_VERSION=1.31.1
+
+# gcc toolchain + valgrind; the rest mirror test/Dockerfile's build deps.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gcc make libc-dev \
+        valgrind \
+        libpcre2-dev zlib1g-dev libssl-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Module sources copied into /src (the addon dir referenced by `config`).
+COPY config /src/config
+COPY src /src/src
+
+# Fetch and unpack the pinned nginx source.
+RUN set -eux; \
+    mkdir -p /usr/src/nginx; \
+    curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+        -o /tmp/nginx.tar.gz; \
+    tar -xzf /tmp/nginx.tar.gz -C /usr/src/nginx --strip-components=1; \
+    rm /tmp/nginx.tar.gz
+
+# Static debug build.
+#   -O0 : valgrind's leak/uninit attribution is sharpest with no optimisation.
+#   -g -fno-omit-frame-pointer : readable stacks.
+#   -DNGX_DEBUG_PALLOC=1 : each pool allocation hits ngx_alloc()/free() so
+#       valgrind tracks per-allocation lifetime (otherwise pool-backed memory
+#       looks like one big block and per-request leaks are invisible).
+#   -Wno-error : addon/core warnings must not abort the build.
+#
+# --with-compat + --with-http_realip_module are MANDATORY (OUR config uses
+# set_real_ip_from / real_ip_header). proxy is core.
+WORKDIR /usr/src/nginx
+RUN set -eux; \
+    ./configure \
+        --prefix=/etc/nginx \
+        --sbin-path=/usr/sbin/nginx \
+        --conf-path=/etc/nginx/nginx.conf \
+        --pid-path=/run/nginx.pid \
+        --error-log-path=/var/log/nginx/error.log \
+        --http-log-path=/var/log/nginx/access.log \
+        --modules-path=/usr/lib/nginx/modules \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --with-cc-opt="-O0 -g -fno-omit-frame-pointer -DNGX_DEBUG_PALLOC=1 -Wno-error" \
+        --add-module=/src; \
+    make -j"$(nproc)"; \
+    make install; \
+    /usr/sbin/nginx -V 2>&1; \
+    mkdir -p /var/log/nginx
+
+# Static content root for the soft-limited locations (same as test/Dockerfile).
+RUN set -eux; \
+    mkdir -p /usr/share/test-html; \
+    printf 'ok\n' > /usr/share/test-html/ok.txt
+
+# Install OUR test config with the load_module line STRIPPED (module is built-in
+# for a static build — see Dockerfile.asan for the full rationale).
+COPY test/conf/nginx.conf /tmp/nginx.conf.in
+RUN sed '/load_module .*ngx_http_soft_limit_req_module/d' /tmp/nginx.conf.in \
+        > /etc/nginx/nginx.conf
+
+# Suppressions for nginx-core "free everything on process exit" startup pools
+# that show up as definite/indirect leaks but are not defects. Tightly scoped
+# to nginx-core frames — never our module. See the file for per-stanza notes.
+COPY test/docker/valgrind.supp /etc/valgrind.supp
+
+# Gate helper at a stable path (used by test/valgrind.sh after docker cp).
+COPY test/check-valgrind-log.sh /usr/local/bin/check-valgrind-log.sh
+RUN chmod +x /usr/local/bin/check-valgrind-log.sh
+
+EXPOSE 80
+STOPSIGNAL SIGQUIT
+# Default CMD runs nginx in the foreground for ad-hoc `docker run` inspection;
+# test/valgrind.sh overrides the entrypoint with `sleep infinity` and drives
+# everything via docker exec.
+CMD ["nginx", "-g", "daemon off;"]
