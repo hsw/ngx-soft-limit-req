@@ -33,3 +33,16 @@ core.*
 
 # Dropbox conflicted copies (this tree lives under Dropbox)
 *conflicted copy*
+
+# Debian packaging build artifacts. debian/changelog and debian/control are
+# GENERATED at build time (by dch and debian/prepare.sh respectively) — they are
+# never committed; debian/control.in is the committed template.
+debian/changelog
+debian/control
+debian/files
+debian/.debhelper/
+debian/*.substvars
+debian/*.debhelper.log
+debian/debhelper-build-stamp
+debian/libnginx-mod-http-soft-limit-req/
+dist/

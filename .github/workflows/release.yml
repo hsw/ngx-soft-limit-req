@@ -1,0 +1,193 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        # Defaults ON for safety — workflow_dispatch with default inputs must
+        # NOT cut a GH Release. Operator must explicitly uncheck the box in the
+        # GHA UI to publish. The tag-push path is unaffected (no inputs).
+        description: 'Skip publish (default ON for safety; uncheck to publish)'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Inlined actionlint (fast-fails the workflow YAML before the docker
+      # build). Tag-push releases skip test.yml, so this is the release path's
+      # only actionlint coverage. Install logic shared via test/ci helper.
+      - name: Install actionlint
+        id: install_actionlint
+        run: echo "actionlint=$(bash test/ci/install-actionlint.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Run actionlint
+        run: ${{ steps.install_actionlint.outputs.actionlint }} .github/workflows/*.yml
+
+      - name: Validate tag
+        # Reject refs that don't look like a real release tag (vN.N.N...).
+        # Prevents a non-semver MODULE_VERSION from leaking into
+        # `dch -v "<ver>-1"` later. On tag-push, GITHUB_REF_NAME is the pushed
+        # tag. The suffix class is constrained to Debian-version-safe characters
+        # and the separator excludes '-': dch builds the Debian version as
+        # MODULE_VERSION-1, so a tag like v0.3.0-rc.1 would yield 0.3.0-rc.1-1,
+        # which dpkg version-sorts NEWER than 0.3.0 (no semver pre-release
+        # semantics). Use the Debian-idiomatic '~' (sorts EARLIER), e.g.
+        # v0.3.0~rc1. Pass the ref via env (not ${{ }} interpolated into the
+        # shell) so a hostile tag can't inject commands before bash parses it.
+        env:
+          MODULE_REF: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s' "$MODULE_REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([+~][a-zA-Z0-9.+~]+)?$'; then
+              echo "release.yml: tag must match ^v[0-9]+\.[0-9]+\.[0-9]+([+~]<suffix>)?$ (use '~' not '-' for prereleases per Debian convention; got: ${MODULE_REF})" >&2
+              exit 1
+          fi
+        if: github.event_name == 'push'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Builds nginx (pinned NGINX_VERSION) + the module in Docker and runs the
+      # full integration suite — the same gate as test.yml.
+      - name: Run integration suite
+        run: ./test/run.sh
+
+  build-deb:
+    needs: test
+    runs-on: ubuntu-latest
+    container: ubuntu:${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ["22.04", "24.04", "26.04"]
+    env:
+      DEBEMAIL: "ci@ngx-soft-limit-req.local"
+      DEBFULLNAME: "ngx-soft-limit-req CI"
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Bootstrap deps
+        run: |
+          apt-get update
+          apt-get install -y devscripts equivs ca-certificates curl gnupg sudo git
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install nginx mainline
+        run: bash test/ci/install-nginx-mainline.sh
+
+      - name: Compute versions
+        # On tag-push, GITHUB_REF_NAME is the tag (e.g. v0.1.0). Strip the
+        # leading 'v' so dpkg sees a digit-leading version; the Debian revision
+        # defaults to 1 (first build of this tag).
+        #
+        # NGINX_VERSION is read from the INSTALLED nginx package (the binary the
+        # module is built against), NOT the apt Candidate. The `sed 's/-.*//'`
+        # strips the apt -<distro_revision> suffix (e.g. 1.31.1-1~jammy ->
+        # 1.31.1) so debian/prepare.sh receives a clean upstream version.
+        env:
+          MODULE_REF: ${{ github.ref_name }}
+        run: |
+          MODULE_VERSION="${MODULE_REF#v}"
+          NGINX_VERSION=$(dpkg-query -W -f='${Version}' nginx | sed 's/-.*//')
+          {
+              echo "MODULE_VERSION=$MODULE_VERSION"
+              echo "NGINX_VERSION=$NGINX_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Substitute ABI-pin
+        run: bash debian/prepare.sh "$NGINX_VERSION"
+
+      - name: Initialise debian/changelog
+        run: |
+          dch --create -v "${MODULE_VERSION}-1" \
+            --package libnginx-mod-http-soft-limit-req \
+            --controlmaint \
+            "Build against nginx ${NGINX_VERSION}"
+
+      - name: Install build deps from control
+        run: mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b --no-sign
+
+      - name: Collect .deb artefacts into workspace
+        # dpkg-buildpackage writes the .deb into the PARENT of the source tree
+        # (outside $GITHUB_WORKSPACE). upload-artifact only accepts paths within
+        # the workspace, so copy into ./dist/<distro>/. The per-distro subdir
+        # avoids same-name collisions across the matrix slots.
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/${{ matrix.distro }}"
+          cp ../*.deb "$GITHUB_WORKSPACE/dist/${{ matrix.distro }}/"
+
+      - name: Upload .deb artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.distro }}
+          path: dist/${{ matrix.distro }}/*.deb
+          retention-days: 7
+
+  publish:
+    needs: build-deb
+    # Publishes on tag-push or when dry_run is unchecked. The `||` short-circuits
+    # — github.event_name=='push' makes the rest moot, otherwise the negation of
+    # inputs.dry_run is consulted. Default dry_run=true keeps manual dispatch a
+    # no-op publish unless explicitly opted in.
+    if: github.event_name == 'push' || !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Compute tag
+        id: ver
+        env:
+          MODULE_REF: ${{ github.ref_name }}
+        run: |
+          echo "tag=$MODULE_REF" >> "$GITHUB_OUTPUT"
+          echo "name=$MODULE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb artefacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          # No merge-multiple: keep each distro's artifacts in its own subdir
+          # under dist/deb-<distro>/ so identically-named .deb files don't
+          # overwrite each other.
+
+      - name: Rename .deb with distro suffix
+        # Disambiguate identically-named .deb files across distros so the GH
+        # Release attaches all 3 (1 package × 3 distros) rather than only the
+        # last writer. Result: libnginx-mod-http-soft-limit-req_X-Y_amd64.deb
+        # becomes ..._amd64.ubuntu-<distro>.deb.
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          for distro_dir in dist/deb-*; do
+              distro="${distro_dir##*/deb-}"
+              for f in "$distro_dir"/*.deb; do
+                  base=$(basename "$f" .deb)
+                  cp "$f" "dist/release/${base}.ubuntu-${distro}.deb"
+              done
+          done
+          ls -la dist/release
+
+      - name: Create GH Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }}
+          files: dist/release/*.deb
+          generate_release_notes: true

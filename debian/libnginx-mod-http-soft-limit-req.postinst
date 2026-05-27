@@ -1,0 +1,36 @@
+#!/bin/sh
+# postinst — register the soft_limit_req module's load_module snippet on
+# `configure`.
+#
+# Standard Debian/Ubuntu libnginx-mod-* idiom: ship a load_module snippet in
+# /usr/share/nginx/modules-available/ and symlink it into
+# /etc/nginx/modules-enabled/. On a Debian/Ubuntu nginx (nginx-common) — whose
+# nginx.conf already sources `include /etc/nginx/modules-enabled/*.conf;` at the
+# main context — that auto-enables the module.
+#
+# We deliberately do NOT edit nginx.conf. The nginx.org mainline `nginx` package
+# does not ship the modules-enabled include; on that package the operator must
+# enable the module themselves (add the include, or a direct `load_module`) —
+# see the project README. Modifying a conffile owned by the nginx package is
+# avoided on purpose.
+#
+# Idempotent: `ln -sf` overwrites any existing (even dangling) symlink, so
+# re-running `dpkg --configure -a` is harmless. The matching postrm removes the
+# symlink on remove/purge.
+
+set -e
+
+ENABLED_DIR=/etc/nginx/modules-enabled
+SNIPPET=/usr/share/nginx/modules-available/mod-http-soft-limit-req.conf
+LINK="${ENABLED_DIR}/50-mod-http-soft-limit-req.conf"
+
+case "$1" in
+    configure)
+        mkdir -p "$ENABLED_DIR"
+        ln -sf "$SNIPPET" "$LINK"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

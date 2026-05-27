@@ -1,0 +1,26 @@
+Source: libnginx-mod-http-soft-limit-req
+Section: httpd
+Priority: optional
+Maintainer: ngx-soft-limit-req CI <ci@ngx-soft-limit-req.local>
+Build-Depends: debhelper-compat (= 13), build-essential, libpcre2-dev, libssl-dev, zlib1g-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/hsw/ngx-soft-limit-req
+Vcs-Browser: https://github.com/hsw/ngx-soft-limit-req
+Vcs-Git: https://github.com/hsw/ngx-soft-limit-req.git
+
+Package: libnginx-mod-http-soft-limit-req
+Architecture: any
+Depends: nginx (>> @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
+Description: tag-don't-reject soft rate-limiter module for nginx
+ A dynamic nginx module providing soft_limit_req: a tag-don't-reject rate
+ limiter. It runs the stock limit_req leaky-bucket math but, on overflow, never
+ rejects the request. Instead it writes a per-directive verdict variable
+ ("1" when over the cap, "" otherwise) that a map can consume to reroute
+ over-cap "grey" traffic to a separate upstream, while a stock limit_req keeps
+ hard-blocking abusive clients in the same location.
+ .
+ Each soft_limit_req directive gets its own verdict variable and every zone is
+ evaluated on every request, so a hard-rejecting zone and one or more tag-only
+ zones can coexist in a single location without ever returning an error to
+ legitimate under-cap users. This is the supported way to shed an L7 flood to a
+ sacrificial or challenge tier without dropping organic traffic.

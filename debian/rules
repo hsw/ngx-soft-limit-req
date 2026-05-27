@@ -1,0 +1,45 @@
+#!/usr/bin/make -f
+# debian/rules — build the soft_limit_req dynamic module under debhelper.
+#
+# This tree ships a single HTTP module whose source is referenced by the
+# top-level `config` (ngx_module_name=ngx_http_soft_limit_req_module). One
+# --add-dynamic-module pointing at the repo root, plus a single
+# configure + `make modules`, produces objs/ngx_http_soft_limit_req_module.so,
+# which dh_install then places into the binary package.
+#
+# Build-time env override:
+#   NGINX_SRC  — path to an unpacked nginx source tree (consumed via `?=`
+#                below). Default: /usr/local/src/nginx, the symlink set by
+#                test/ci/install-nginx-mainline.sh to /usr/local/src/nginx-${VER}/.
+
+NGINX_SRC ?= /usr/local/src/nginx
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# Single --add-dynamic-module pointing at the repo root, where the
+	# top-level `config` lives. --with-compat keeps the .so binary-compatible
+	# with the running nginx server.
+	cd $(NGINX_SRC) && ./configure \
+	    --with-compat \
+	    --add-dynamic-module=$(CURDIR)
+
+override_dh_auto_build:
+	# Builds the module into $(NGINX_SRC)/objs/. The nginx source tarball is
+	# unpacked into /usr/local/src/nginx-${VER}/ as root by
+	# test/ci/install-nginx-mainline.sh, so this works without an explicit copy.
+	$(MAKE) -C $(NGINX_SRC) modules
+
+override_dh_auto_install:
+	# Stage the .so into debian/tmp/ so dh_install (driven by the per-package
+	# .install file) can copy it into the package staging tree. dh_install
+	# resolves source paths RELATIVE to debian/tmp/, not the host filesystem
+	# root, so the .so must be staged here first.
+	install -d $(CURDIR)/debian/tmp/usr/lib/nginx/modules
+	install -m 0644 $(NGINX_SRC)/objs/ngx_http_soft_limit_req_module.so \
+	    $(CURDIR)/debian/tmp/usr/lib/nginx/modules/
+
+override_dh_auto_clean:
+	-cd $(NGINX_SRC) && $(MAKE) clean 2>/dev/null || true
+	dh_auto_clean

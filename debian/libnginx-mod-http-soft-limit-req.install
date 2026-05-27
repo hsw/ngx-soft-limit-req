@@ -1,0 +1,2 @@
+usr/lib/nginx/modules/ngx_http_soft_limit_req_module.so usr/lib/nginx/modules/
+debian/mod-http-soft-limit-req.conf usr/share/nginx/modules-available/

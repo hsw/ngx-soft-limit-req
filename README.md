@@ -171,6 +171,35 @@ and re-test.
 
 The Docker test harness (`test/`) pins the nginx version and builds the `.so` automatically.
 
+### Install (Debian/Ubuntu package)
+
+Tagged releases publish a `libnginx-mod-http-soft-limit-req_*.deb` per Ubuntu version, each
+built against that distro's nginx.org mainline with an ABI-pinned `Depends` on the matching
+`nginx`. Install with:
+
+```sh
+apt install ./libnginx-mod-http-soft-limit-req_<ver>_<arch>.deb
+```
+
+The package installs the `.so` to `/usr/lib/nginx/modules/` and a `load_module` snippet to
+`/usr/share/nginx/modules-available/`, symlinked into `/etc/nginx/modules-enabled/`.
+
+**Enabling — the package does NOT modify `nginx.conf`** (it never edits a file owned by the
+`nginx` package):
+
+- On a **Debian/Ubuntu distro `nginx`** (`nginx-common`), `nginx.conf` already sources
+  `include /etc/nginx/modules-enabled/*.conf;` at the main context, so the module is enabled
+  automatically — just `nginx -t && systemctl reload nginx`.
+- On **nginx.org mainline `nginx`** (which ships no such include), add one main-context line
+  to `nginx.conf` yourself (at the top level, outside `events{}` / `http{}`) — either source
+  the directory or load the module directly:
+
+```nginx
+include /etc/nginx/modules-enabled/*.conf;
+# — or, equivalently —
+load_module modules/ngx_http_soft_limit_req_module.so;
+```
+
 ## Testing
 
 No C unit-test framework — the suite is Docker + curl/load (bash). It builds the `.so`
