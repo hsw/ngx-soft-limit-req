@@ -70,11 +70,16 @@ ou="${pair##*|}"
 
 printf 'scenario A (flood host): final over_host="%s" over_uri="%s"\n' "$oh" "$ou"
 
-if [ "$saw_host_over" -eq 1 ] && [ "$oh" = "1" ]; then
+# Assert the verdict FLIPPED to "1" at some point during the flood (saw_host_over),
+# NOT that the final request is still "1": at rate=1r/s the leaky bucket can drain
+# back under burst between the over-budget peak and the last (slow curl -D -)
+# request, which is runner-timing-dependent (it flaked on a slow CI runner). The
+# meaningful property — "this directive's variable flips under flood" — is
+# saw_host_over; independence is covered by the present-but-empty $over_uri check.
+if [ "$saw_host_over" -eq 1 ]; then
     pass 'A: $over_host flipped to "1" under host flood'
 else
-    fail "$(printf 'A: expected $over_host="1" (saw_over=%s final="%s")' \
-        "$saw_host_over" "$oh")"
+    fail "$(printf 'A: $over_host never flipped under host flood (final="%s")' "$oh")"
 fi
 
 # assert the URI verdict is PRESENT-but-empty ("v="), not just falsy/absent.
@@ -102,11 +107,12 @@ ou="${pair##*|}"
 
 printf 'scenario B (flood uri): final over_host="%s" over_uri="%s"\n' "$oh" "$ou"
 
-if [ "$saw_uri_over" -eq 1 ] && [ "$ou" = "1" ]; then
+# Same as A: assert it flipped during the flood (saw_uri_over), not the final
+# request's value (drains back under burst at rate=1r/s on slow runners).
+if [ "$saw_uri_over" -eq 1 ]; then
     pass 'B: $over_uri flipped to "1" under uri flood'
 else
-    fail "$(printf 'B: expected $over_uri="1" (saw_over=%s final="%s")' \
-        "$saw_uri_over" "$ou")"
+    fail "$(printf 'B: $over_uri never flipped under uri flood (final="%s")' "$ou")"
 fi
 
 # assert the HOST verdict is PRESENT-but-empty ("v="), not just falsy/absent.
