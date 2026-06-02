@@ -80,6 +80,8 @@ static void ngx_http_soft_limit_req_expire(
     ngx_http_soft_limit_req_ctx_t *ctx, ngx_uint_t n);
 
 static ngx_int_t ngx_http_soft_limit_req_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r,
+    ngx_array_t *limits, ngx_http_variable_value_t *seen);
 static ngx_int_t ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_soft_limit_req_init_zone(ngx_shm_zone_t *shm_zone,
@@ -149,15 +151,9 @@ ngx_module_t  ngx_http_soft_limit_req_module = {
 static ngx_int_t
 ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
 {
-    uint32_t                          hash;
-    ngx_str_t                         key;
-    ngx_int_t                         rc;
-    ngx_uint_t                        n, excess, accounted;
-    ngx_http_variable_value_t        *vv, *seen;
-    ngx_http_soft_limit_req_ctx_t    *ctx;
-    ngx_http_soft_limit_req_conf_t   *slrcf;
+    ngx_http_variable_value_t            *seen;
+    ngx_http_soft_limit_req_conf_t       *slrcf;
     ngx_http_soft_limit_req_main_conf_t  *slrmcf;
-    ngx_http_soft_limit_req_limit_t  *limit, *limits;
 
     /*
      * Account the leaky bucket EXACTLY ONCE per external request, on the FIRST
@@ -254,6 +250,45 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
     }
 
     /*
+     * Run the shared accounting loop, passing the once-per-request marker so it
+     * is consumed (seen->valid set) only if a zone actually charged a bucket.
+     */
+    return ngx_http_soft_limit_req_run_limits(r, &slrcf->limits, seen);
+}
+
+
+/*
+ * Shared accounting core for both the PREACCESS (location-scope) and POST_READ
+ * (server-scope) handlers. Tag-don't-reject: evaluate EVERY configured zone on
+ * every request (no break on overflow), account in a single pass under the zone
+ * shmtx, flip the per-directive set=$var verdict to "1" on overflow, and always
+ * return NGX_DECLINED.
+ *
+ * `seen` is the optional once-per-request marker (a slot in r->variables):
+ *   - PREACCESS passes its redirect-surviving guard slot; it is consumed
+ *     (seen->valid set) after the loop ONLY if at least one zone actually
+ *     charged a bucket (lookup() returned NGX_OK / NGX_BUSY). On an all-bypass
+ *     pass (every key empty / oversized) OR an all-degraded pass (every zone
+ *     full -> NGX_ERROR, nothing charged) it stays unset, mirroring stock's
+ *     limit_req_status, so a later internal-redirect target still accounts.
+ *   - POST_READ passes NULL: it runs exactly once per external request and
+ *     needs no marker (see the POST_READ handler comment).
+ *
+ * The caller is responsible for the r != r->main and limits.nelts == 0 guards.
+ */
+static ngx_int_t
+ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r, ngx_array_t *limits,
+    ngx_http_variable_value_t *seen)
+{
+    uint32_t                          hash;
+    ngx_str_t                         key;
+    ngx_int_t                         rc;
+    ngx_uint_t                        n, excess, accounted;
+    ngx_http_variable_value_t        *vv;
+    ngx_http_soft_limit_req_ctx_t    *ctx;
+    ngx_http_soft_limit_req_limit_t  *limit, *elts;
+
+    /*
      * Track whether any zone actually CHARGED a bucket this pass (lookup()
      * returned NGX_OK or NGX_BUSY, not NGX_ERROR). The once-per-request marker
      * is consumed only if it did, so an all-bypass entry location (every key
@@ -262,18 +297,11 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      */
     accounted = 0;
 
-    limits = slrcf->limits.elts;
+    elts = limits->elts;
 
-    /*
-     * Tag-don't-reject: evaluate EVERY configured zone on every request
-     * (no break on overflow), account in a single pass under the zone shmtx,
-     * and always return NGX_DECLINED. The over/under verdict is carried per
-     * directive via set=$var.
-     */
+    for (n = 0; n < limits->nelts; n++) {
 
-    for (n = 0; n < slrcf->limits.nelts; n++) {
-
-        limit = &limits[n];
+        limit = &elts[n];
 
         ctx = limit->shm_zone->data;
 
@@ -391,9 +419,9 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      * pass (every key empty or oversized) OR an all-degraded pass (every zone
      * full -> NGX_ERROR, nothing charged) the marker stays unset, mirroring
      * stock's limit_req_status, so a later internal-redirect target with a real
-     * limiter still accounts.
+     * limiter still accounts. A NULL seen (POST_READ) skips the marker entirely.
      */
-    if (accounted) {
+    if (seen != NULL && accounted) {
         seen->valid = 1;
         seen->not_found = 0;
     }
