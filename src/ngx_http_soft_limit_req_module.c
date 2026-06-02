@@ -1310,6 +1310,20 @@ ngx_http_soft_limit_req_init(ngx_conf_t *cf)
      * the REWRITE phase, so its verdict variable is visible to rewrite-phase
      * directives. No once-per-request marker needed (see the handler comment for
      * the verified-against-nginx-source no-double-charge invariant).
+     *
+     * Ordering vs ngx_http_realip_module (verified against nginx 1.31.1): realip
+     * also registers a POST_READ handler (ngx_http_realip_module.c). nginx calls
+     * postconfiguration in module order (ngx_http.c ngx_http_block), and an
+     * --add-dynamic-module module is appended LAST in the module array
+     * (ngx_module.c ngx_add_module: before = modules_n when no explicit order),
+     * so our postconfiguration runs AFTER realip's and we push our POST_READ
+     * handler AFTER realip's. ngx_http_init_phase_handlers() then flattens each
+     * phase's handlers in REVERSE push order (for j = nelts-1; j >= 0; j--), so
+     * the LAST-pushed handler runs FIRST. Net effect: THIS handler runs BEFORE
+     * realip rewrites $remote_addr. A $remote_addr-keyed server zone therefore
+     * sees the raw TCP peer, not the realip client IP (documented in README +
+     * proven by test case 95). Keep this in mind if the registration order or
+     * build mode ever changes.
      */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
     if (h == NULL) {
