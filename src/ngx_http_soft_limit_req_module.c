@@ -55,6 +55,18 @@ typedef struct {
 } ngx_http_soft_limit_req_conf_t;
 
 
+/*
+ * Server-scope configuration for the soft_limit_req_server directive.
+ * Identical shape to the location conf (a single limits array, no flags):
+ * the only difference is the conf scope (NGX_HTTP_SRV_CONF_OFFSET) and the
+ * phase its handler runs in (POST_READ). Kept as a distinct type so the
+ * create/merge slots and handler reads are unambiguous.
+ */
+typedef struct {
+    ngx_array_t                       limits;
+} ngx_http_soft_limit_req_srv_conf_t;
+
+
 typedef struct {
     /*
      * Index into r->variables of an internal guard variable used as a
@@ -80,11 +92,17 @@ static void ngx_http_soft_limit_req_expire(
     ngx_http_soft_limit_req_ctx_t *ctx, ngx_uint_t n);
 
 static ngx_int_t ngx_http_soft_limit_req_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r,
+    ngx_array_t *limits, ngx_http_variable_value_t *seen);
 static ngx_int_t ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_soft_limit_req_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static void *ngx_http_soft_limit_req_create_main_conf(ngx_conf_t *cf);
+static void *ngx_http_soft_limit_req_create_srv_conf(ngx_conf_t *cf);
+static char *ngx_http_soft_limit_req_merge_srv_conf(ngx_conf_t *cf,
+    void *parent, void *child);
 static void *ngx_http_soft_limit_req_create_conf(ngx_conf_t *cf);
 static char *ngx_http_soft_limit_req_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -92,6 +110,10 @@ static char *ngx_http_soft_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_soft_limit_req_server(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
+    ngx_array_t *limits);
 static ngx_int_t ngx_http_soft_limit_req_init(ngx_conf_t *cf);
 
 
@@ -111,6 +133,21 @@ static ngx_command_t  ngx_http_soft_limit_req_commands[] = {
       0,
       NULL },
 
+    /*
+     * Server-scope, POST_READ. NGX_HTTP_MAIN_CONF is included (alongside
+     * NGX_HTTP_SRV_CONF) so the directive is also accepted at http{} level: with
+     * NGX_HTTP_SRV_CONF_OFFSET storage, an http-level instance lands in the
+     * http-context srv conf, which merge_srv_conf propagates to ALL servers that
+     * define none of their own — intended (documented in README). Deliberately
+     * NOT NGX_HTTP_LOC_CONF: POST_READ runs before any location is matched.
+     */
+    { ngx_string("soft_limit_req_server"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE123,
+      ngx_http_soft_limit_req_server,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
       ngx_null_command
 };
 
@@ -122,8 +159,8 @@ static ngx_http_module_t  ngx_http_soft_limit_req_module_ctx = {
     ngx_http_soft_limit_req_create_main_conf, /* create main configuration */
     NULL,                                  /* init main configuration */
 
-    NULL,                                  /* create server configuration */
-    NULL,                                  /* merge server configuration */
+    ngx_http_soft_limit_req_create_srv_conf, /* create server configuration */
+    ngx_http_soft_limit_req_merge_srv_conf,  /* merge server configuration */
 
     ngx_http_soft_limit_req_create_conf,   /* create location configuration */
     ngx_http_soft_limit_req_merge_conf     /* merge location configuration */
@@ -149,15 +186,9 @@ ngx_module_t  ngx_http_soft_limit_req_module = {
 static ngx_int_t
 ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
 {
-    uint32_t                          hash;
-    ngx_str_t                         key;
-    ngx_int_t                         rc;
-    ngx_uint_t                        n, excess, accounted;
-    ngx_http_variable_value_t        *vv, *seen;
-    ngx_http_soft_limit_req_ctx_t    *ctx;
-    ngx_http_soft_limit_req_conf_t   *slrcf;
+    ngx_http_variable_value_t            *seen;
+    ngx_http_soft_limit_req_conf_t       *slrcf;
     ngx_http_soft_limit_req_main_conf_t  *slrmcf;
-    ngx_http_soft_limit_req_limit_t  *limit, *limits;
 
     /*
      * Account the leaky bucket EXACTLY ONCE per external request, on the FIRST
@@ -254,6 +285,104 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
     }
 
     /*
+     * Run the shared accounting loop, passing the once-per-request marker so it
+     * is consumed (seen->valid set) only if a zone actually charged a bucket.
+     */
+    return ngx_http_soft_limit_req_run_limits(r, &slrcf->limits, seen);
+}
+
+
+static ngx_int_t
+ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *slrscf;
+
+    /*
+     * Server-scope handler, registered in the POST_READ phase so its set=$var
+     * verdict is written BEFORE the REWRITE phase and is therefore readable by
+     * rewrite-phase consumers (if / rewrite / early log) as well as the
+     * precontent-phase try_files (the verdict stays readable because PRECONTENT
+     * runs after POST_READ), unlike the PREACCESS location-scope handler whose
+     * verdict only lands in time for the content phase.
+     *
+     * NO ONCE-PER-REQUEST MARKER IS NEEDED HERE (unlike the PREACCESS handler).
+     * The bucket is accounted EXACTLY ONCE per external request because POST_READ
+     * runs exactly once on the external request and NEVER re-runs on any internal
+     * re-entry. Verified against the pinned nginx source (nginx-1.31.1,
+     * src/http/ngx_http_core_module.c):
+     *
+     *   - POST_READ is phase index 0 and SERVER_REWRITE is the next phase
+     *     (ngx_http_core_module.h: NGX_HTTP_POST_READ_PHASE = 0, then
+     *     NGX_HTTP_SERVER_REWRITE_PHASE). Anything that rewinds r->phase_handler
+     *     to at/after server_rewrite_index re-enters AFTER POST_READ.
+     *   - try_files fallback, error_page, and X-Accel-Redirect all funnel through
+     *     ngx_http_internal_redirect() (line 2582), which calls ngx_http_handler()
+     *     (line 2630) with r->internal == 1; ngx_http_handler() then sets
+     *     r->phase_handler = cmcf->phase_engine.server_rewrite_index (line 868),
+     *     i.e. PAST POST_READ.
+     *   - ngx_http_named_location() (try_files -> @named, error_page -> @named;
+     *     line 2637) sets r->phase_handler = cmcf->phase_engine.location_rewrite_index
+     *     (line 2694) — later still, also past POST_READ.
+     *   - `rewrite ... last` does NOT call either redirect helper: it loops within
+     *     the phase engine via ngx_http_core_post_rewrite_phase() (line 1064),
+     *     which sets r->phase_handler = ph->next (line 1099) — the continuation
+     *     after the rewrite phases, never rewinding to POST_READ.
+     *   - Subrequests (auth_request / mirror / SSI) are excluded by the
+     *     r != r->main guard below: a helper request must neither tag nor account.
+     *
+     * Because no internal-redirect vector re-runs POST_READ and subrequests are
+     * declined, a single un-marked accounting pass cannot double-charge. We pass
+     * seen = NULL to ngx_http_soft_limit_req_run_limits() (no marker write). The
+     * verdict written into r->variables survives the redirect (neither redirect
+     * helper touches r->variables) and stays readable on the served request.
+     */
+
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
+
+    slrscf = ngx_http_get_module_srv_conf(r, ngx_http_soft_limit_req_module);
+
+    if (slrscf->limits.nelts == 0) {
+        return NGX_DECLINED;
+    }
+
+    return ngx_http_soft_limit_req_run_limits(r, &slrscf->limits, NULL);
+}
+
+
+/*
+ * Shared accounting core for both the PREACCESS (location-scope) and POST_READ
+ * (server-scope) handlers. Tag-don't-reject: evaluate EVERY configured zone on
+ * every request (no break on overflow), account in a single pass under the zone
+ * shmtx, flip the per-directive set=$var verdict to "1" on overflow, and always
+ * return NGX_DECLINED.
+ *
+ * `seen` is the optional once-per-request marker (a slot in r->variables):
+ *   - PREACCESS passes its redirect-surviving guard slot; it is consumed
+ *     (seen->valid set) after the loop ONLY if at least one zone actually
+ *     charged a bucket (lookup() returned NGX_OK / NGX_BUSY). On an all-bypass
+ *     pass (every key empty / oversized) OR an all-degraded pass (every zone
+ *     full -> NGX_ERROR, nothing charged) it stays unset, mirroring stock's
+ *     limit_req_status, so a later internal-redirect target still accounts.
+ *   - POST_READ passes NULL: it runs exactly once per external request and
+ *     needs no marker (see the POST_READ handler comment).
+ *
+ * The caller is responsible for the r != r->main and limits.nelts == 0 guards.
+ */
+static ngx_int_t
+ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r, ngx_array_t *limits,
+    ngx_http_variable_value_t *seen)
+{
+    uint32_t                          hash;
+    ngx_str_t                         key;
+    ngx_int_t                         rc;
+    ngx_uint_t                        n, excess, accounted;
+    ngx_http_variable_value_t        *vv;
+    ngx_http_soft_limit_req_ctx_t    *ctx;
+    ngx_http_soft_limit_req_limit_t  *limit, *elts;
+
+    /*
      * Track whether any zone actually CHARGED a bucket this pass (lookup()
      * returned NGX_OK or NGX_BUSY, not NGX_ERROR). The once-per-request marker
      * is consumed only if it did, so an all-bypass entry location (every key
@@ -262,18 +391,11 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      */
     accounted = 0;
 
-    limits = slrcf->limits.elts;
+    elts = limits->elts;
 
-    /*
-     * Tag-don't-reject: evaluate EVERY configured zone on every request
-     * (no break on overflow), account in a single pass under the zone shmtx,
-     * and always return NGX_DECLINED. The over/under verdict is carried per
-     * directive via set=$var.
-     */
+    for (n = 0; n < limits->nelts; n++) {
 
-    for (n = 0; n < slrcf->limits.nelts; n++) {
-
-        limit = &limits[n];
+        limit = &elts[n];
 
         ctx = limit->shm_zone->data;
 
@@ -391,9 +513,9 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      * pass (every key empty or oversized) OR an all-degraded pass (every zone
      * full -> NGX_ERROR, nothing charged) the marker stays unset, mirroring
      * stock's limit_req_status, so a later internal-redirect target with a real
-     * limiter still accounts.
+     * limiter still accounts. A NULL seen (POST_READ) skips the marker entirely.
      */
-    if (accounted) {
+    if (seen != NULL && accounted) {
         seen->valid = 1;
         seen->not_found = 0;
     }
@@ -407,10 +529,11 @@ ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     /*
-     * Default get_handler for a set=$var that the PREACCESS handler never
-     * wrote on this request (e.g. the location has no soft_limit_req, or the
-     * variable is read before PREACCESS runs). Report not-found so it reads as
-     * empty/false rather than leaking a stale value.
+     * Default get_handler for a set=$var that neither the PREACCESS nor the
+     * POST_READ handler wrote on this request (e.g. the location/server has no
+     * soft_limit_req(_server), or the variable is read before either handler
+     * runs). Report not-found so it reads as empty/false rather than leaking a
+     * stale value.
      */
     v->not_found = 1;
 
@@ -839,17 +962,53 @@ ngx_http_soft_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/*
+ * Thin wrapper for the location/server-inherited soft_limit_req directive
+ * (PREACCESS). Resolves its own (location) conf and hands the target limits
+ * array to the shared parser below. soft_limit_req_server has its own wrapper
+ * resolving the srv conf; both share ngx_http_soft_limit_req_parse so duplicate-
+ * zone detection and array-init are relative to whichever conf the directive
+ * writes to.
+ */
 static char *
 ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_soft_limit_req_conf_t  *slrcf = conf;
 
+    return ngx_http_soft_limit_req_parse(cf, cmd, &slrcf->limits);
+}
+
+
+/*
+ * Thin wrapper for the server-scope soft_limit_req_server directive (POST_READ).
+ * Resolves its srv conf and hands its limits array to the shared parser.
+ */
+static char *
+ngx_http_soft_limit_req_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *slrscf = conf;
+
+    return ngx_http_soft_limit_req_parse(cf, cmd, &slrscf->limits);
+}
+
+
+/*
+ * Shared parser for both soft_limit_req (location/server) and
+ * soft_limit_req_server. `limits` is the TARGET array of the resolving
+ * directive's conf: array-init and duplicate-zone detection are performed
+ * against it so each directive writes only to its own scope. The pool used for
+ * the array is cf->pool, matching the conf the wrapper resolved.
+ */
+static char *
+ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
+    ngx_array_t *limits)
+{
     ngx_int_t                         burst, set_index;
     ngx_str_t                        *value, s, name;
     ngx_uint_t                        i;
     ngx_shm_zone_t                   *shm_zone;
     ngx_http_variable_t              *var;
-    ngx_http_soft_limit_req_limit_t  *limit, *limits;
+    ngx_http_soft_limit_req_limit_t  *limit, *elts;
 
     value = cf->args->elts;
 
@@ -930,9 +1089,16 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             /*
-             * The PREACCESS handler writes r->variables[set_index] directly;
-             * the get_handler only fires when the handler never ran for this
-             * request, in which case the variable reads as not-found (empty).
+             * The PREACCESS or POST_READ handler writes r->variables[set_index]
+             * directly; the get_handler only fires when neither handler ran for
+             * this request, in which case the variable reads as not-found
+             * (empty). If the SAME set=$var is shared by both soft_limit_req and
+             * soft_limit_req_server, ngx_http_add_variable returns the existing
+             * variable, so this get_handler == NULL check is skipped on the
+             * second registration (harmless). Both handlers back the same slot;
+             * last-writer-wins = PREACCESS (it runs after POST_READ on the same
+             * request, overwriting any POST_READ verdict). In practice the two
+             * directives target separate zones and separate verdict variables.
              */
             if (var->get_handler == NULL) {
                 var->get_handler = ngx_http_soft_limit_req_variable;
@@ -958,10 +1124,10 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    limits = slrcf->limits.elts;
+    elts = limits->elts;
 
-    if (limits == NULL) {
-        if (ngx_array_init(&slrcf->limits, cf->pool, 1,
+    if (elts == NULL) {
+        if (ngx_array_init(limits, cf->pool, 1,
                            sizeof(ngx_http_soft_limit_req_limit_t))
             != NGX_OK)
         {
@@ -969,13 +1135,13 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
-    for (i = 0; i < slrcf->limits.nelts; i++) {
-        if (shm_zone == limits[i].shm_zone) {
+    for (i = 0; i < limits->nelts; i++) {
+        if (shm_zone == elts[i].shm_zone) {
             return "is duplicate";
         }
     }
 
-    limit = ngx_array_push(&slrcf->limits);
+    limit = ngx_array_push(limits);
     if (limit == NULL) {
         return NGX_CONF_ERROR;
     }
@@ -1002,6 +1168,48 @@ ngx_http_soft_limit_req_create_main_conf(ngx_conf_t *cf)
     conf->seen_index = NGX_CONF_UNSET;
 
     return conf;
+}
+
+
+static void *
+ngx_http_soft_limit_req_create_srv_conf(ngx_conf_t *cf)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool,
+                       sizeof(ngx_http_soft_limit_req_srv_conf_t));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    /*
+     * set by ngx_pcalloc():
+     *
+     *     conf->limits.elts = NULL;
+     */
+
+    return conf;
+}
+
+
+static char *
+ngx_http_soft_limit_req_merge_srv_conf(ngx_conf_t *cf, void *parent,
+    void *child)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *prev = parent;
+    ngx_http_soft_limit_req_srv_conf_t  *conf = child;
+
+    /*
+     * http -> server inheritance (same elts == NULL idiom as the loc merge):
+     * a server that defines no soft_limit_req_server of its own inherits the
+     * http-level limits. Consequently an http{}-level soft_limit_req_server is
+     * inherited by ALL servers — this is intended (documented in README).
+     */
+    if (conf->limits.elts == NULL) {
+        conf->limits = prev->limits;
+    }
+
+    return NGX_CONF_OK;
 }
 
 
@@ -1097,6 +1305,33 @@ ngx_http_soft_limit_req_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_soft_limit_req_handler;
+
+    /*
+     * Server-scope handler in POST_READ: runs once per external request, before
+     * the REWRITE phase, so its verdict variable is visible to rewrite-phase
+     * directives. No once-per-request marker needed (see the handler comment for
+     * the verified-against-nginx-source no-double-charge invariant).
+     *
+     * Ordering vs ngx_http_realip_module (verified against nginx 1.31.1): realip
+     * also registers a POST_READ handler (ngx_http_realip_module.c). nginx calls
+     * postconfiguration in module order (ngx_http.c ngx_http_block), and an
+     * --add-dynamic-module module is appended LAST in the module array
+     * (ngx_module.c ngx_add_module: before = modules_n when no explicit order),
+     * so our postconfiguration runs AFTER realip's and we push our POST_READ
+     * handler AFTER realip's. ngx_http_init_phase_handlers() then flattens each
+     * phase's handlers in REVERSE push order (for j = nelts-1; j >= 0; j--), so
+     * the LAST-pushed handler runs FIRST. Net effect: THIS handler runs BEFORE
+     * realip rewrites $remote_addr. A $remote_addr-keyed server zone therefore
+     * sees the raw TCP peer, not the realip client IP (documented in README +
+     * proven by test case 95). Keep this in mind if the registration order or
+     * build mode ever changes.
+     */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_soft_limit_req_server_handler;
 
     return NGX_OK;
 }

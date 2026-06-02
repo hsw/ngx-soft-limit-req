@@ -7,7 +7,7 @@ over-cap ("grey") traffic to a separate upstream, while a stock `limit_req` keep
 blocking abusive IPs **in the same location**.
 
 > Status: **implemented** and integration-tested against pinned **nginx 1.31.1** (current
-> mainline) on **Ubuntu 24.04** — 16 checks (5 harness + 11 behavior cases).
+> mainline) on **Ubuntu 24.04** — 23 checks (5 harness + 18 behavior cases).
 
 ## Why
 
@@ -29,7 +29,8 @@ request, and never rejects.
 
 ```nginx
 soft_limit_req_zone <key> zone=NAME:SIZE rate=Nr/s;     # http{}, same as stock limit_req_zone
-soft_limit_req zone=NAME [burst=N] [set=$var];          # server/location
+soft_limit_req zone=NAME [burst=N] [set=$var];          # server/location  (PREACCESS)
+soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http/server      (POST_READ)
 ```
 
 - `rate=` accepts `Nr/s` or `Nr/m` (requests per second or per minute), same as stock
@@ -39,7 +40,10 @@ soft_limit_req zone=NAME [burst=N] [set=$var];          # server/location
   verdict flips to `"1"` as soon as the smoothed rate exceeds `rate=`. Give it a non-zero value
   to allow a short spike before tagging.
 
-- `set=$var` — target variable, written per request in the PREACCESS phase. The handler
+- `set=$var` — target variable, written once per request. The phase depends on which
+  directive sets it: `soft_limit_req` writes it in PREACCESS, `soft_limit_req_server` writes
+  it in POST_READ (see the [`soft_limit_req_server`](#soft_limit_req_server--verdict-in-the-rewrite-phase-post_read)
+  section). The handler
   writes `"1"` when the bucket is over `burst`, and `""` otherwise — including the
   under-budget path, the empty-key (verified-bypass) path, and an oversized key. So `""`
   means "not over" and routes to `main`. `set=` is optional; omit it to run the bucket
@@ -103,6 +107,174 @@ still empty there. To hard-reject on a soft signal, route via `map` to a dead-en
 - Key the stock IP zone on the **real client IP** (after `realip`), not the CDN/proxy address.
 - A verified-bypass HMAC cookie can map to an empty key on the soft host zone so reroute never
   bites verified users; the IP hard-block still applies.
+
+## `soft_limit_req_server` — verdict in the rewrite phase (POST_READ)
+
+```nginx
+soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http{} / server{}
+```
+
+`soft_limit_req_server` runs the **same** leaky-bucket accounting against the **same**
+`soft_limit_req_zone` shared zones, but emits its verdict in the **POST_READ** phase —
+*before* the **REWRITE** phase. That makes `set=$var` readable by rewrite-phase directives
+(`if`, `rewrite`, `set`), by precontent-phase `try_files`, and by an early `access_log` — not
+only by the lazy content-phase `map` → `proxy_pass` pattern. (All of these run after
+POST_READ, so the verdict is already set by the time they evaluate it.)
+
+This is the positive counterpart to the [`map`, not `if`](#caveat-use-map-not-if) caveat:
+the location-level `soft_limit_req` writes its verdict in PREACCESS, which runs *after* the
+rewrite phase, so `if ($over_host) return 444;` never sees it. `soft_limit_req_server` writes
+the verdict early enough for `if`/`return` to fire.
+
+### How it differs from location-level `soft_limit_req`
+
+| | `soft_limit_req` | `soft_limit_req_server` |
+|---|---|---|
+| phase | PREACCESS | POST_READ (earlier) |
+| scope | `server{}` / `location{}` | `http{}` / `server{}` (not `location{}`) |
+| verdict readable in | content phase (`map`) | rewrite phase (`if`/`rewrite`), precontent (`try_files`) **and** content phase |
+| per-location rates | yes | no — there is no matched location yet at POST_READ |
+
+Everything else is identical: it reuses the zones declared by `soft_limit_req_zone`, never
+rejects, writes `"1"` when the bucket is over `burst` and `""` otherwise (including the
+empty-key / oversized-key / eval-failure bypass paths), and evaluates every configured zone
+on every request. `burst=` and `set=$var` behave exactly as for `soft_limit_req`.
+
+It is **not** allowed in `location{}`: POST_READ runs before any location is matched, so a
+per-location placement would have no meaning. Place it in `server{}`, or in `http{}` to apply
+it to **all** servers — an `http`-level `soft_limit_req_server` is inherited by every server
+that does not declare its own (a server that declares any `soft_limit_req_server` of its own
+overrides the inherited set entirely, same inheritance rule as other server-scoped lists).
+
+### Key-readiness constraint (important)
+
+Because the verdict is computed in POST_READ, the **zone key variable must already resolve at
+POST_READ**. If the key evaluates empty (or oversized, or fails to evaluate), that zone is
+**silently skipped** — no charge, verdict left `""`. There is no runtime error; the limiter
+just becomes a no-op, which is easy to misread as "under budget".
+
+- **POST_READ-safe keys:** `$host`, `$http_*` (any request header). Use these. They resolve
+  from the request line/headers, are stable across phases, and are **realip-independent** — so
+  evaluating them at POST_READ neither reads a phase-sensitive value nor disturbs any other
+  consumer.
+- **Do NOT key on `$remote_addr` (or any cacheable, realip-affected / late-bound variable) —
+  it POISONS that variable for the whole request.** Two problems compound here:
+  1. **Wrong value at POST_READ.** `ngx_http_realip_module` also runs in POST_READ, and this
+     module's handler runs **before** realip's, so when `soft_limit_req_server` evaluates
+     `$remote_addr` it is still the **raw TCP peer** (your CDN/LB address), *not* the rewritten
+     client IP — even with a global `set_real_ip_from`. The order is fixed by nginx internals:
+     postconfiguration runs in module order and an `--add-dynamic-module` module is appended
+     last, so it pushes its POST_READ handler after realip; the phase engine then flattens
+     POST_READ handlers in reverse push order, so the last-pushed (ours) runs first.
+  2. **Cache poisoning of the whole request (the real footgun).** `$remote_addr` is a
+     **cacheable** variable (its get_handler sets `no_cacheable = 0`). Our key is a compiled
+     complex value, evaluated via the *indexed* (caching) variable path, so the first read
+     populates and caches `r->variables[$remote_addr]` with the **raw peer**. realip later
+     rewrites only `r->connection->addr_text`/`sockaddr` — it does **not** invalidate that
+     variable cache. So every *subsequent* `$remote_addr` read in the same request —
+     `proxy_set_header X-Real-IP`, access-log `$remote_addr`, `map $remote_addr …`, the
+     PREACCESS `soft_limit_req` / stock `limit_req` — also sees the stale **raw peer**, not the
+     realip client IP. Keying a `soft_limit_req_server` zone on `$remote_addr` therefore
+     silently corrupts logging, headers, maps, and downstream limiters for the entire request.
+     This is action-at-a-distance and very hard to debug.
+  - **What to do instead:** for a server-scope `soft_limit_req_server` zone, key on `$host` /
+    `$http_*` (stable, realip-independent, no poisoning) — **never** `$remote_addr`, global
+    realip or not. Because this module's POST_READ handler runs *before* realip's POST_READ
+    pass (see above), a server-scope zone always reads the **raw peer** at POST_READ *and*
+    poisons `$remote_addr` for the rest of the request; configuring realip globally does **not**
+    change that. Per-real-client-IP limiting on `$remote_addr` belongs in a **PREACCESS /
+    location-level** limiter (location-level `soft_limit_req`, or stock `limit_req`), and even
+    there it is reliable **only when `set_real_ip_from` / `real_ip_header` are configured at
+    `http{}` or `server{}` level** (global). At that scope realip's **POST_READ** pass rewrites
+    the address before the *PREACCESS* limiter reads its key: realip's POST_READ handler
+    resolves `r->loc_conf` to the server's default location, finds `rlcf->from` set, and
+    rewrites `$remote_addr` then — so by the time a PREACCESS limiter evaluates the key it is
+    already the client IP, and the cache is populated with the correct value. **If realip is
+    configured only inside a `location{}`**, even a location-level `soft_limit_req` is *not*
+    safe: realip's POST_READ pass sees no inherited config (`rlcf->from == NULL`, no location
+    matched yet) and does nothing, and realip only rewrites in its **PREACCESS** pass — but our
+    PREACCESS handler is pushed last and the phase engine flattens handlers in reverse push
+    order, so our PREACCESS handler runs **before** realip's. A location-level `soft_limit_req`
+    keyed on `$remote_addr` can therefore still read and cache the raw peer (same poisoning).
+    (Test case `95` locks in this ordering **and** exercises the poisoning side effect: it
+    asserts that even by the content phase `$remote_addr` reads the constant raw peer, because
+    our POST_READ key eval cached it.)
+- **Resolves, but to the *early* value (usually not what you want):** `$uri`. nginx sets
+  `r->uri` while parsing the request line, *before* POST_READ, so a `$uri`-keyed server zone
+  does resolve — but it keys on the **pre-rewrite, normalized** URI (the original request
+  target), not the post-`rewrite`/post-internal-redirect URI you might expect. It does **not**
+  silently bypass; it just keys on a value that ignores any later `rewrite`/`try_files`/
+  `error_page` redirect. Use it only if keying on the original URI is genuinely intended.
+- **NOT POST_READ-safe (genuinely empty — silent bypass):** `$upstream_*` (no upstream chosen
+  until the content phase) and anything else set by a later phase. Keying a
+  `soft_limit_req_server` zone on one of these makes the key empty at POST_READ, so the zone
+  **silently bypasses** every request. Prefer `$host`/`$http_*`-keyed zones with this directive.
+
+### Shared `set=$var` with `soft_limit_req` — last-writer-wins
+
+The same `set=$var` name may be used by both directives (the verdict variable's get_handler
+is backed by both the POST_READ and PREACCESS writers). If both write the **same** variable
+on the same request, **PREACCESS wins** — `soft_limit_req_server` writes it in POST_READ and a
+location-level `soft_limit_req` overwrites it later in PREACCESS (last-writer-wins =
+PREACCESS). In practice the two directives target separate zones and separate verdict
+variables, so this is an edge case, but it is worth stating: to read the *early* verdict in
+the rewrite phase, give `soft_limit_req_server` its own `set=$var`.
+
+Distinct from the verdict overwrite above: if both directives point at the **same zone**, that
+zone's bucket is charged **twice** per request — once in POST_READ by `soft_limit_req_server`
+and again in PREACCESS by `soft_limit_req`. Use **separate zones** for the two directives.
+
+### Example — hard-reject in the rewrite phase via `if`
+
+```nginx
+soft_limit_req_zone $host zone=perhost:64m rate=12000r/s;
+
+server {
+    listen 80;
+    server_name app.example;
+
+    soft_limit_req_server zone=perhost burst=2000 set=$over_host;  # POST_READ
+
+    location / {
+        if ($over_host) { return 444; }   # rewrite phase — now sees the verdict
+        proxy_pass http://main;
+    }
+}
+
+upstream main { server backend.example:80; }
+```
+
+Once `$host` is over its cap, `$over_host` is `"1"` at POST_READ and the rewrite-phase `if`
+fires (`444`). Under budget it is `""`, so the `if` is falsy and the request is proxied
+normally.
+
+### Example — content-phase `map` → `proxy_pass` still works
+
+The original lazy routing pattern works unchanged with `soft_limit_req_server` (the verdict
+is set early and survives into the content phase):
+
+```nginx
+soft_limit_req_zone $host zone=perhost:64m rate=12000r/s;
+
+map $over_host $pool {            # http{} only; read lazily at proxy_pass
+    "1"     grey_pool;
+    default main;
+}
+
+server {
+    listen 80;
+    server_name app.example;
+
+    soft_limit_req_server zone=perhost burst=2000 set=$over_host;  # POST_READ
+
+    location / {
+        proxy_pass http://$pool;   # main | grey_pool
+    }
+}
+
+upstream main      { server backend.example:80; }
+upstream grey_pool { server challenge.example:80; }   # sacrificial / challenge tier
+```
 
 ## Limitations & semantics
 
@@ -210,15 +382,24 @@ against pinned nginx, boots a container, and runs every `test/cases/*.sh`. Run:
 ```
 
 Checks: 5 harness checks (`.so` built, `nginx -t` syntax + module load, server up,
-`GET /` → 200) plus 11 behavior cases — zone + directive parsing (`10`, both
+`GET /` → 200) plus 18 behavior cases — zone + directive parsing (`10`, both
 `soft_limit_req_zone` and the `soft_limit_req` location directive), never-rejects under flood
 with the verdict actually flipping to `1` (`20`), single + multi `set=$var` (`30`/`31`), stock
 IP hard-block coexisting with soft host routing via `map` plus the negative `if` phase-order
 assertion (`40`), shm-stability soak (`50`), empty-key verified-bypass (`60`), zone-full /
 alloc-failure graceful degradation (`70`), and the internal-redirect accounting cases —
 same-zone re-entry counted once (`80`), redirect-target-only limiter accounts (`81`), and
-bypass-entry-then-redirect-target (`82`). The config snippets above mirror
-`test/conf/nginx.conf`.
+bypass-entry-then-redirect-target (`82`). The `soft_limit_req_server` (POST_READ) directive
+adds seven server-scope cases: `soft_limit_req_server` parse + scope acceptance, including
+rejection inside `location{}` (`11`); the headline verdict-visible-in-REWRITE proof via
+`if`→444 (`90`); single-charge across `try_files`/`error_page`/`rewrite ... last` re-entry
+(`91`); coexistence of both directives on separate zones with independent budgets (`92`); the
+key-readiness footgun encoded as an executable fact (an `$upstream_addr`-keyed zone whose
+verdict never flips because the key is empty at POST_READ — `93`); http{}-level inheritance
+firing at runtime on a server that declares none of its own (`94`); and the realip-vs-POST_READ
+ordering ground truth — a `$remote_addr`-keyed server zone buckets on the raw TCP peer because
+our handler runs before realip's POST_READ rewrite (`95`). The config snippets above
+mirror `test/conf/nginx.conf`.
 
 Empty-verdict assertions emit the header as `add_header X-Over "v=$over_host" always` so a
 present-but-empty verdict reads `v=` and is distinguishable from an absent header (nginx drops
