@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 #
-# Case 95: GROUND TRUTH — soft_limit_req_server (POST_READ) runs BEFORE the
-# built-in ngx_http_realip_module's POST_READ handler, so a $remote_addr-keyed
-# server zone sees the RAW TCP peer at POST_READ, not the realip-rewritten
-# client IP.
+# Case 95: GROUND TRUTH + FOOTGUN — soft_limit_req_server (POST_READ) runs
+# BEFORE the built-in ngx_http_realip_module's POST_READ handler, so a
+# $remote_addr-keyed server zone sees the RAW TCP peer at POST_READ, not the
+# realip-rewritten client IP.
+#
+# This case ALSO demonstrates the cache-poisoning side effect, which is the
+# DANGEROUS part: $remote_addr is a CACHEABLE variable (its get_handler sets
+# no_cacheable=0). Our key is a compiled complex value evaluated via the indexed
+# (caching) variable path, so the POST_READ eval populates and caches
+# r->variables[$remote_addr] with the RAW peer. realip later rewrites only
+# r->connection->addr_text/sockaddr -- it does NOT invalidate that variable
+# cache. So EVERY later $remote_addr read in the same request (proxy_set_header,
+# access logs, maps, the PREACCESS limiter, and X-Remote here) returns the SAME
+# stale raw peer. (a) below asserts exactly that constancy: it is the poisoning,
+# not a benign coincidence. DO NOT key soft_limit_req_server on $remote_addr in
+# production; use $host/$http_* (server scope) or location-level soft_limit_req
+# (PREACCESS) for per-real-client limiting. See README key-readiness section.
 #
 # Why (verified against pinned nginx 1.31.1):
 #   - Both realip and this module register their handler in NGX_HTTP_POST_READ_PHASE
@@ -51,24 +64,28 @@ get_over_remote() {
 }
 
 # =========================================================================
-# (a) the vhost is reachable and the real TCP peer is CONSTANT across requests
+# (a) CACHE POISONING: content-phase $remote_addr stays the CONSTANT raw peer
+#     across varied XFF (proves our POST_READ key eval poisoned the cache)
 # =========================================================================
-# Reachability control for (b): a varied-XFF request returns a real proxied 200.
-# X-Remote surfaces $remote_addr in the content phase; we only require that two
-# requests carrying DIFFERENT XFF IPs report the SAME $remote_addr (the constant
-# docker bridge peer). That constancy is the whole premise of (b): because the
-# real peer never changes, the ONLY way svrealip could bucket distinctly per XFF
-# is if realip had rewritten $remote_addr before our POST_READ handler ran. (b)
-# shows it does not.
+# X-Remote surfaces $remote_addr in the content phase. Two requests carrying
+# DIFFERENT XFF IPs report the SAME $remote_addr. If realip had run first (and
+# nothing poisoned the cache), the content-phase $remote_addr would be the
+# realip-rewritten, per-request-distinct XFF IP. Instead it is the constant
+# docker-bridge raw peer for BOTH requests: our POST_READ key eval read the
+# cacheable $remote_addr and cached the raw peer in r->variables, and realip's
+# later rewrite of c->addr_text does NOT invalidate that cache -- so the
+# content-phase read returns the stale raw peer. This is the action-at-a-distance
+# footgun: any other $remote_addr consumer (logs/headers/maps/limiters) would be
+# corrupted the same way. It also serves as the reachability control for (b).
 r1="$(get_over_remote "203.0.113.7")"
 r2="$(get_over_remote "203.0.113.8")"
 a_code="${r1%%|*}"
 rem1="${r1##*|}"
 rem2="${r2##*|}"
 if [ "$a_code" = "200" ] && [ -n "$rem1" ] && [ "$rem1" = "$rem2" ]; then
-    pass "(a) vhost reachable (200), real TCP peer constant across XFF variation ($rem1)"
+    pass "(a) content-phase \$remote_addr is the CONSTANT raw peer across XFF variation ($rem1) -> POST_READ key eval poisoned the cache (footgun)"
 else
-    fail "$(printf '(a) expected 200 + constant peer, got code=%s peer1=%s peer2=%s' "$a_code" "$rem1" "$rem2")"
+    fail "$(printf '(a) expected 200 + constant poisoned peer, got code=%s peer1=%s peer2=%s' "$a_code" "$rem1" "$rem2")"
 fi
 
 # =========================================================================

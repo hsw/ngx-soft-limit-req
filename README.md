@@ -7,7 +7,7 @@ over-cap ("grey") traffic to a separate upstream, while a stock `limit_req` keep
 blocking abusive IPs **in the same location**.
 
 > Status: **implemented** and integration-tested against pinned **nginx 1.31.1** (current
-> mainline) on **Ubuntu 24.04** — 22 checks (5 harness + 17 behavior cases).
+> mainline) on **Ubuntu 24.04** — 23 checks (5 harness + 18 behavior cases).
 
 ## Why
 
@@ -152,25 +152,42 @@ POST_READ**. If the key evaluates empty (or oversized, or fails to evaluate), th
 **silently skipped** — no charge, verdict left `""`. There is no runtime error; the limiter
 just becomes a no-op, which is easy to misread as "under budget".
 
-- **POST_READ-safe keys:** `$host`, `$http_*` (any request header). Use these. The raw
-  `$remote_addr` / proxy-protocol client address is also populated, but see the realip caveat
-  below before keying on it.
-- **`$remote_addr` is NOT the realip-rewritten address here.** `ngx_http_realip_module` also
-  runs in POST_READ, and this module's handler runs **before** realip's, so at the moment
-  `soft_limit_req_server` evaluates its key `$remote_addr` is still the **raw TCP peer**
-  (your CDN/LB address), *not* the rewritten client IP — even with a global `set_real_ip_from`.
-  The order is fixed by nginx internals: postconfiguration runs in module order and an
-  `--add-dynamic-module` module is appended last, so it pushes its POST_READ handler after
-  realip; the phase engine then flattens POST_READ handlers in reverse push order, so the
-  last-pushed (ours) runs first. Net effect: a `$remote_addr`-keyed server zone buckets every
-  request behind a given proxy into **one** bucket. If you need per-real-client limiting, do
-  it with the location-level `soft_limit_req` (PREACCESS — realip's PREACCESS handler has run
-  by then), or key the server zone on `$http_*` instead. (Test case `95` locks this ordering in.)
-- **NOT POST_READ-safe:** `$uri` (no location matched, URI not yet rewritten), `$upstream_*`
-  (no upstream chosen until the content phase), and anything set by a later phase. Keying a
-  `soft_limit_req_server` zone on one of these makes the key empty at POST_READ, so the zone
-  **silently bypasses** every request. Prefer `$host`/`$http_*`-keyed zones with this
-  directive (and treat `$remote_addr` as the *raw peer*, per the realip caveat above).
+- **POST_READ-safe keys:** `$host`, `$http_*` (any request header). Use these. They resolve
+  from the request line/headers, are stable across phases, and are **realip-independent** — so
+  evaluating them at POST_READ neither reads a phase-sensitive value nor disturbs any other
+  consumer.
+- **Do NOT key on `$remote_addr` (or any cacheable, realip-affected / late-bound variable) —
+  it POISONS that variable for the whole request.** Two problems compound here:
+  1. **Wrong value at POST_READ.** `ngx_http_realip_module` also runs in POST_READ, and this
+     module's handler runs **before** realip's, so when `soft_limit_req_server` evaluates
+     `$remote_addr` it is still the **raw TCP peer** (your CDN/LB address), *not* the rewritten
+     client IP — even with a global `set_real_ip_from`. The order is fixed by nginx internals:
+     postconfiguration runs in module order and an `--add-dynamic-module` module is appended
+     last, so it pushes its POST_READ handler after realip; the phase engine then flattens
+     POST_READ handlers in reverse push order, so the last-pushed (ours) runs first.
+  2. **Cache poisoning of the whole request (the real footgun).** `$remote_addr` is a
+     **cacheable** variable (its get_handler sets `no_cacheable = 0`). Our key is a compiled
+     complex value, evaluated via the *indexed* (caching) variable path, so the first read
+     populates and caches `r->variables[$remote_addr]` with the **raw peer**. realip later
+     rewrites only `r->connection->addr_text`/`sockaddr` — it does **not** invalidate that
+     variable cache. So every *subsequent* `$remote_addr` read in the same request —
+     `proxy_set_header X-Real-IP`, access-log `$remote_addr`, `map $remote_addr …`, the
+     PREACCESS `soft_limit_req` / stock `limit_req` — also sees the stale **raw peer**, not the
+     realip client IP. Keying a `soft_limit_req_server` zone on `$remote_addr` therefore
+     silently corrupts logging, headers, maps, and downstream limiters for the entire request.
+     This is action-at-a-distance and very hard to debug.
+  - **What to do instead:** for per-real-client-IP limiting use the **location-level
+    `soft_limit_req`** (PREACCESS — realip's PREACCESS handler has already rewritten the
+    address, and PREACCESS reads it *after* it is correct); for server-scope zones key on
+    `$host` / `$http_*` (stable, realip-independent, no poisoning). (Test case `95` locks in
+    this ordering **and** exercises the poisoning side effect: it asserts that even by the
+    content phase `$remote_addr` reads the constant raw peer, because our POST_READ key eval
+    cached it.)
+- **NOT POST_READ-safe (silent bypass):** `$uri` (no location matched, URI not yet rewritten),
+  `$upstream_*` (no upstream chosen until the content phase), and anything set by a later
+  phase. Keying a `soft_limit_req_server` zone on one of these makes the key empty at
+  POST_READ, so the zone **silently bypasses** every request. Prefer `$host`/`$http_*`-keyed
+  zones with this directive.
 
 ### Shared `set=$var` with `soft_limit_req` — last-writer-wins
 
