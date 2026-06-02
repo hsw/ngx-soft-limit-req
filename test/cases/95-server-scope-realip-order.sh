@@ -47,8 +47,16 @@ set -uo pipefail
 
 . "$(dirname "$0")/../lib/_caselib.sh"
 
-# Per-run unique host so a case-level rerun against the long-lived container does
-# not read a bucket an earlier run already pushed over budget (run_tag idiom).
+# NOTE on rerun-safety: unlike cases 90/91/92, this case CANNOT be host-isolated.
+# The svrealip zone is keyed purely on $remote_addr — the test client's raw TCP
+# peer (the constant docker-bridge address) — NOT on Host. The per-run host suffix
+# below only keeps the *.realip.example vhost selection unambiguous; it does NOT
+# give each run a fresh bucket, because the bucket key (the raw peer) is identical
+# across runs. This case therefore asserts the POISONING / raw-peer BEHAVIOUR, not
+# a pristine first-flip: (a) the content-phase $remote_addr is the constant raw
+# peer across varied XFF, and (b) a varied-XFF flood trips the single shared
+# raw-peer bucket. Both hold regardless of whatever state earlier runs left in
+# that bucket, so the demonstration is honest and rerun-stable.
 run_tag="$(date +%s%N)-$$"
 HOST="r1-${run_tag}.realip.example"
 
@@ -93,9 +101,15 @@ fi
 # =========================================================================
 # Constant Host + constant real TCP peer, but a DISTINCT XFF IP every request.
 # If realip ran before our handler, $remote_addr at POST_READ would be the (per
-# request distinct) XFF IP -> each its own burst=0 bucket -> NEVER trips. It
-# trips because our POST_READ handler keys on the raw, constant peer BEFORE
-# realip rewrites it. Non-vacuous: burst 0 makes the 2nd same-key request flip.
+# request distinct) XFF IP -> each its own burst=0 bucket -> the flood would
+# spread across N never-repeated buckets and NEVER trip, no matter how long it
+# runs. It DOES trip because our POST_READ handler keys on the raw, CONSTANT peer
+# BEFORE realip rewrites it, so every request lands in the SAME burst=0 bucket.
+# This is the discriminator and it does NOT depend on the bucket starting fresh:
+# a primed/over-budget bucket (e.g. left by subcase (a) above, which hits the
+# same raw-peer bucket) trips immediately; a fresh one trips on the 2nd request.
+# Either way "varied XFF still trips a $remote_addr server zone" can ONLY happen
+# if our handler read the constant raw peer first.
 B_N=20
 b_saw_over=0
 b_last=""
@@ -109,9 +123,9 @@ for i in $(seq 1 "$B_N"); do
     fi
 done
 if [ "$b_saw_over" -eq 1 ]; then
-    pass '(b) varied-XFF flood tripped svrealip -> v=1 (POST_READ saw the raw peer, BEFORE realip)'
+    pass '(b) varied-XFF flood tripped the shared raw-peer svrealip bucket -> v=1 (POST_READ keyed the constant raw peer, BEFORE realip; varied XFF could NOT trip otherwise)'
 else
-    fail "$(printf '(b) verdict never flipped to v=1 under varied-XFF flood (last=%s) -- would mean realip ran first' "$b_last")"
+    fail "$(printf '(b) verdict never flipped to v=1 under varied-XFF flood (last=%s) -- would mean realip ran first (per-XFF buckets never accumulate to a trip)' "$b_last")"
 fi
 
 finish

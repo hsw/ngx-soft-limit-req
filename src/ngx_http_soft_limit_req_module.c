@@ -300,9 +300,10 @@ ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
     /*
      * Server-scope handler, registered in the POST_READ phase so its set=$var
      * verdict is written BEFORE the REWRITE phase and is therefore readable by
-     * rewrite-phase consumers (if / try_files / rewrite / early log), unlike the
-     * PREACCESS location-scope handler whose verdict only lands in time for the
-     * content phase.
+     * rewrite-phase consumers (if / rewrite / early log) as well as the
+     * precontent-phase try_files (the verdict stays readable because PRECONTENT
+     * runs after POST_READ), unlike the PREACCESS location-scope handler whose
+     * verdict only lands in time for the content phase.
      *
      * NO ONCE-PER-REQUEST MARKER IS NEEDED HERE (unlike the PREACCESS handler).
      * The bucket is accounted EXACTLY ONCE per external request because POST_READ
