@@ -3,7 +3,10 @@
 # Case 93: key-readiness CAVEAT as an executable fact (documents a FOOTGUN).
 #
 # soft_limit_req_server runs in POST_READ. Its zone key MUST be a variable that
-# is already resolvable that early ($host / $http_* / $remote_addr). This case
+# is already resolvable that early ($host / $http_* are the safe choices).
+# NOTE: $remote_addr is NOT safe for server scope — at POST_READ it reads the raw
+# TCP peer (realip has not rewritten it yet) and the read poisons its variable
+# cache for the whole request (see README key-readiness section + case 95). This case
 # pins the FAILURE mode of choosing a key that is NOT POST_READ-ready, so the
 # footgun is encoded as a test rather than left as prose — in-convention with
 # case 40 (d), which encodes the PREACCESS phase-order caveat the same way.
