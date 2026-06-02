@@ -109,6 +109,10 @@ static char *ngx_http_soft_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_soft_limit_req_server(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
+    ngx_array_t *limits);
 static ngx_int_t ngx_http_soft_limit_req_init(ngx_conf_t *cf);
 
 
@@ -125,6 +129,21 @@ static ngx_command_t  ngx_http_soft_limit_req_commands[] = {
       NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
       ngx_http_soft_limit_req,
       NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    /*
+     * Server-scope, POST_READ. NGX_HTTP_MAIN_CONF is included (alongside
+     * NGX_HTTP_SRV_CONF) so the directive is also accepted at http{} level: with
+     * NGX_HTTP_SRV_CONF_OFFSET storage, an http-level instance lands in the
+     * http-context srv conf, which merge_srv_conf propagates to ALL servers that
+     * define none of their own — intended (documented in README). Deliberately
+     * NOT NGX_HTTP_LOC_CONF: POST_READ runs before any location is matched.
+     */
+    { ngx_string("soft_limit_req_server"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE123,
+      ngx_http_soft_limit_req_server,
+      NGX_HTTP_SRV_CONF_OFFSET,
       0,
       NULL },
 
@@ -450,10 +469,11 @@ ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     /*
-     * Default get_handler for a set=$var that the PREACCESS handler never
-     * wrote on this request (e.g. the location has no soft_limit_req, or the
-     * variable is read before PREACCESS runs). Report not-found so it reads as
-     * empty/false rather than leaking a stale value.
+     * Default get_handler for a set=$var that neither the PREACCESS nor the
+     * POST_READ handler wrote on this request (e.g. the location/server has no
+     * soft_limit_req(_server), or the variable is read before either handler
+     * runs). Report not-found so it reads as empty/false rather than leaking a
+     * stale value.
      */
     v->not_found = 1;
 
@@ -882,17 +902,53 @@ ngx_http_soft_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/*
+ * Thin wrapper for the location/server-inherited soft_limit_req directive
+ * (PREACCESS). Resolves its own (location) conf and hands the target limits
+ * array to the shared parser below. soft_limit_req_server has its own wrapper
+ * resolving the srv conf; both share ngx_http_soft_limit_req_parse so duplicate-
+ * zone detection and array-init are relative to whichever conf the directive
+ * writes to.
+ */
 static char *
 ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_soft_limit_req_conf_t  *slrcf = conf;
 
+    return ngx_http_soft_limit_req_parse(cf, cmd, &slrcf->limits);
+}
+
+
+/*
+ * Thin wrapper for the server-scope soft_limit_req_server directive (POST_READ).
+ * Resolves its srv conf and hands its limits array to the shared parser.
+ */
+static char *
+ngx_http_soft_limit_req_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *slrscf = conf;
+
+    return ngx_http_soft_limit_req_parse(cf, cmd, &slrscf->limits);
+}
+
+
+/*
+ * Shared parser for both soft_limit_req (location/server) and
+ * soft_limit_req_server. `limits` is the TARGET array of the resolving
+ * directive's conf: array-init and duplicate-zone detection are performed
+ * against it so each directive writes only to its own scope. The pool used for
+ * the array is cf->pool, matching the conf the wrapper resolved.
+ */
+static char *
+ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
+    ngx_array_t *limits)
+{
     ngx_int_t                         burst, set_index;
     ngx_str_t                        *value, s, name;
     ngx_uint_t                        i;
     ngx_shm_zone_t                   *shm_zone;
     ngx_http_variable_t              *var;
-    ngx_http_soft_limit_req_limit_t  *limit, *limits;
+    ngx_http_soft_limit_req_limit_t  *limit, *elts;
 
     value = cf->args->elts;
 
@@ -973,9 +1029,16 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             /*
-             * The PREACCESS handler writes r->variables[set_index] directly;
-             * the get_handler only fires when the handler never ran for this
-             * request, in which case the variable reads as not-found (empty).
+             * The PREACCESS or POST_READ handler writes r->variables[set_index]
+             * directly; the get_handler only fires when neither handler ran for
+             * this request, in which case the variable reads as not-found
+             * (empty). If the SAME set=$var is shared by both soft_limit_req and
+             * soft_limit_req_server, ngx_http_add_variable returns the existing
+             * variable, so this get_handler == NULL check is skipped on the
+             * second registration (harmless). Both handlers back the same slot;
+             * last-writer-wins = PREACCESS (it runs after POST_READ on the same
+             * request, overwriting any POST_READ verdict). In practice the two
+             * directives target separate zones and separate verdict variables.
              */
             if (var->get_handler == NULL) {
                 var->get_handler = ngx_http_soft_limit_req_variable;
@@ -1001,10 +1064,10 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    limits = slrcf->limits.elts;
+    elts = limits->elts;
 
-    if (limits == NULL) {
-        if (ngx_array_init(&slrcf->limits, cf->pool, 1,
+    if (elts == NULL) {
+        if (ngx_array_init(limits, cf->pool, 1,
                            sizeof(ngx_http_soft_limit_req_limit_t))
             != NGX_OK)
         {
@@ -1012,13 +1075,13 @@ ngx_http_soft_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
-    for (i = 0; i < slrcf->limits.nelts; i++) {
-        if (shm_zone == limits[i].shm_zone) {
+    for (i = 0; i < limits->nelts; i++) {
+        if (shm_zone == elts[i].shm_zone) {
             return "is duplicate";
         }
     }
 
-    limit = ngx_array_push(&slrcf->limits);
+    limit = ngx_array_push(limits);
     if (limit == NULL) {
         return NGX_CONF_ERROR;
     }
