@@ -34,14 +34,23 @@ set -uo pipefail
 
 . "$(dirname "$0")/../lib/_caselib.sh"
 
+# Per-run unique host suffix so a case-level rerun against a long-lived container
+# (the process-lifetime shared zones persist for the whole run.sh invocation) does
+# not read a bucket that an earlier run already pushed over budget. Matches the
+# run_tag idiom in cases 91/92.
+run_tag="$(date +%s%N)-$$"
+
 # helper: GET / with a given Host and X-Forwarded-For (client IP), print
 # "<http_code>|<X-Over-Srv>".
 #
 # `return 444` closes the connection WITHOUT sending any response, so there is
-# no status line and no headers: curl reports http_code 000 and exits nonzero
-# (empty reply, code 52). We therefore normalise that case to the synthetic code
-# "444" so the assertions can detect the fired `if` positively. A real HTTP
-# response (e.g. proxied 200) yields its actual status line + X-Over-Srv header.
+# no status line and no headers: curl reports http_code 000 and exits with the
+# SPECIFIC code 52 ("empty reply from server"). We normalise ONLY that exact
+# signature to the synthetic code "444" so the assertions detect the fired `if`
+# positively — we deliberately do NOT treat any other nonzero curl rc (connect
+# refused 7, reset 56, timeout 28, …) as 444, so a pure connectivity failure
+# cannot masquerade as the rewrite-phase trip and false-pass sub-case (a). A real
+# HTTP response (e.g. proxied 200) yields its actual status line + X-Over-Srv.
 get_code_over() {
     local host="$1" xff="$2" dump code over rc
     dump="$(curl -s -D - -o /dev/null \
@@ -49,9 +58,10 @@ get_code_over() {
     rc=$?
     code="$(printf '%s\n' "$dump" | awk 'NR == 1 { print $2 }')"
     over="$(printf '%s\n' "$dump" | header_field x-over-srv:)"
-    # No status line + nonzero curl rc => connection closed with no response,
-    # which is exactly what `return 444` produces.
-    if [ -z "$code" ] && [ "$rc" -ne 0 ]; then
+    # No status line + curl rc EXACTLY 52 (CURLE_GOT_NOTHING, "empty reply from
+    # server") => connection closed with no response, which is precisely what
+    # `return 444` produces. Any other rc is left as-is (not 444).
+    if [ -z "$code" ] && [ "$rc" -eq 52 ]; then
         code="444"
     fi
     printf '%s|%s\n' "$code" "$over"
@@ -63,7 +73,7 @@ get_code_over() {
 # Do this first so the budget is pristine: under budget the POST_READ handler
 # resolved the $host key and accounted it, but excess <= burst so $over_host=""
 # -> the `if` does not fire -> proxied 200 with X-Over-Srv "v=".
-res="$(get_code_over "fresh1.rewrite.example" "192.0.2.50")"
+res="$(get_code_over "fresh1-${run_tag}.rewrite.example" "192.0.2.50")"
 b_code="${res%%|*}"
 b_over="${res##*|}"
 if [ "$b_code" = "200" ] && [ "$b_over" = "v=" ]; then
@@ -79,7 +89,12 @@ fi
 # request (so the assertion cannot be attributed to any per-IP limiter — the
 # zone is $host-keyed). svrewrite is rate=1r/s burst=10; a slow header-dumping
 # curl loop overruns it well within the bound below.
-A_HOST="flood.rewrite.example"
+#
+# Sub-case (b) above already proved the vhost is REACHABLE and returns a real
+# 200/v= (verdict empty under budget) — so a synthetic "444" from a pure
+# connectivity failure cannot account for the trip here; the only way to flip
+# from that proven-reachable 200 to a 444 is the rewrite-phase `if` firing.
+A_HOST="flood-${run_tag}.rewrite.example"
 A_N=40
 a_saw_444=0
 a_code=""

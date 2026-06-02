@@ -23,6 +23,15 @@
 # this case proves the negative — an $upstream_addr-keyed zone whose verdict
 # NEVER flips, no matter how hard you flood, because the key is empty.
 #
+# CAVEAT ON RIGOR: with an always-empty key the zone node is never created, so the
+# "verdict never flips" assertion (a) is structurally incapable of failing for the
+# intended reason — it cannot, by construction, prove the flood is "strong enough".
+# The POSITIVE CONTROL for that lives in case 90: it floods an identically-shaped
+# $host-keyed zone with the SAME loop bound (A_N=40, same rate/burst class) and DOES
+# flip the verdict, proving the flood is sufficient when the key IS ready. This case
+# is therefore a DOCUMENTING counterpart to case 90, not an independently non-vacuous
+# trip test — read the two together.
+#
 # Sub-cases:
 #   (a) flood a single $host hard (vary client IP via X-Forwarded-For so no
 #       hypothetical per-IP limiter is implicated) and assert the verdict NEVER
@@ -42,6 +51,11 @@ set -uo pipefail
 
 . "$(dirname "$0")/../lib/_caselib.sh"
 
+# Per-run unique host suffix for rerun-safety against the long-lived container
+# (matches cases 90/91/92). The zone is never charged here, but keeping fresh
+# hosts avoids any cross-run coupling and stays consistent with the other cases.
+run_tag="$(date +%s%N)-$$"
+
 # helper: GET / with a given Host and X-Forwarded-For (client IP), print
 # "<http_code>|<X-Over-Srv>". The verdict is echoed as "v=$over_host" so a
 # present-but-empty verdict ("v=") is distinguishable from an absent header.
@@ -60,7 +74,7 @@ get_code_over() {
 # The empty $upstream_addr key makes the POST_READ handler skip the zone, but it
 # still initialises the verdict to "" first, so X-Over-Srv must read "v=" — the
 # limiter ran and tagged nothing (effective no-op), not header-absent.
-res="$(get_code_over "fresh1.notready.example" "192.0.2.50")"
+res="$(get_code_over "fresh1-${run_tag}.notready.example" "192.0.2.50")"
 c_code="${res%%|*}"
 c_over="${res##*|}"
 if [ "$c_code" = "200" ] && [ "$c_over" = "v=" ]; then
@@ -77,7 +91,7 @@ fi
 # Because $upstream_addr is empty at POST_READ the zone is skipped every request,
 # so the verdict stays "" for ALL of them. We send the full bound and assert "1"
 # is NEVER observed (and every request is 200).
-A_HOST="flood.notready.example"
+A_HOST="flood-${run_tag}.notready.example"
 A_N=40
 a_over_seen=0
 a_any_non200=0
