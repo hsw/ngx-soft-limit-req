@@ -29,7 +29,8 @@ request, and never rejects.
 
 ```nginx
 soft_limit_req_zone <key> zone=NAME:SIZE rate=Nr/s;     # http{}, same as stock limit_req_zone
-soft_limit_req zone=NAME [burst=N] [set=$var];          # server/location
+soft_limit_req zone=NAME [burst=N] [set=$var];          # server/location  (PREACCESS)
+soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http/server      (POST_READ)
 ```
 
 - `rate=` accepts `Nr/s` or `Nr/m` (requests per second or per minute), same as stock
@@ -103,6 +104,123 @@ still empty there. To hard-reject on a soft signal, route via `map` to a dead-en
 - Key the stock IP zone on the **real client IP** (after `realip`), not the CDN/proxy address.
 - A verified-bypass HMAC cookie can map to an empty key on the soft host zone so reroute never
   bites verified users; the IP hard-block still applies.
+
+## `soft_limit_req_server` — verdict in the rewrite phase (POST_READ)
+
+```nginx
+soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http{} / server{}
+```
+
+`soft_limit_req_server` runs the **same** leaky-bucket accounting against the **same**
+`soft_limit_req_zone` shared zones, but emits its verdict in the **POST_READ** phase —
+*before* the **REWRITE** phase. That makes `set=$var` readable by rewrite-phase directives
+(`if`, `try_files`, `rewrite`) and by an early `access_log`, not only by the lazy
+content-phase `map` → `proxy_pass` pattern.
+
+This is the positive counterpart to the [`map`, not `if`](#caveat-use-map-not-if) caveat:
+the location-level `soft_limit_req` writes its verdict in PREACCESS, which runs *after* the
+rewrite phase, so `if ($over_host) return 444;` never sees it. `soft_limit_req_server` writes
+the verdict early enough for `if`/`return` to fire.
+
+### How it differs from location-level `soft_limit_req`
+
+| | `soft_limit_req` | `soft_limit_req_server` |
+|---|---|---|
+| phase | PREACCESS | POST_READ (earlier) |
+| scope | `server{}` / `location{}` | `http{}` / `server{}` (not `location{}`) |
+| verdict readable in | content phase (`map`) | rewrite phase (`if`/`try_files`/`rewrite`) **and** content phase |
+| per-location rates | yes | no — there is no matched location yet at POST_READ |
+
+Everything else is identical: it reuses the zones declared by `soft_limit_req_zone`, never
+rejects, writes `"1"` when the bucket is over `burst` and `""` otherwise (including the
+empty-key / oversized-key / eval-failure bypass paths), and evaluates every configured zone
+on every request. `burst=` and `set=$var` behave exactly as for `soft_limit_req`.
+
+It is **not** allowed in `location{}`: POST_READ runs before any location is matched, so a
+per-location placement would have no meaning. Place it in `server{}`, or in `http{}` to apply
+it to **all** servers — an `http`-level `soft_limit_req_server` is inherited by every server
+that does not declare its own (a server that declares any `soft_limit_req_server` of its own
+overrides the inherited set entirely, same inheritance rule as other server-scoped lists).
+
+### Key-readiness constraint (important)
+
+Because the verdict is computed in POST_READ, the **zone key variable must already resolve at
+POST_READ**. If the key evaluates empty (or oversized, or fails to evaluate), that zone is
+**silently skipped** — no charge, verdict left `""`. There is no runtime error; the limiter
+just becomes a no-op, which is easy to misread as "under budget".
+
+- **POST_READ-safe keys:** `$host`, `$http_*` (any request header), the `$remote_addr` /
+  proxy-protocol client address. Use these.
+- **`$remote_addr` after `realip`:** the realip-rewritten client IP is only reliable at
+  POST_READ when `realip` is configured at a **global** (http/server) scope with **no
+  per-location override** — a per-location `set_real_ip_from` may not have applied yet.
+- **NOT POST_READ-safe:** `$uri` (no location matched, URI not yet rewritten), `$upstream_*`
+  (no upstream chosen until the content phase), and anything set by a later phase. Keying a
+  `soft_limit_req_server` zone on one of these makes the key empty at POST_READ, so the zone
+  **silently bypasses** every request. Reuse only `$host`/`$http_*`/`$remote_addr`-keyed
+  zones with this directive.
+
+### Shared `set=$var` with `soft_limit_req` — last-writer-wins
+
+The same `set=$var` name may be used by both directives (the verdict variable's get_handler
+is backed by both the POST_READ and PREACCESS writers). If both write the **same** variable
+on the same request, **PREACCESS wins** — `soft_limit_req_server` writes it in POST_READ and a
+location-level `soft_limit_req` overwrites it later in PREACCESS (last-writer-wins =
+PREACCESS). In practice the two directives target separate zones and separate verdict
+variables, so this is an edge case, but it is worth stating: to read the *early* verdict in
+the rewrite phase, give `soft_limit_req_server` its own `set=$var`.
+
+### Example — hard-reject in the rewrite phase via `if`
+
+```nginx
+soft_limit_req_zone $host zone=perhost:64m rate=12000r/s;
+
+server {
+    listen 80;
+    server_name app.example;
+
+    soft_limit_req_server zone=perhost burst=2000 set=$over_host;  # POST_READ
+
+    location / {
+        if ($over_host) { return 444; }   # rewrite phase — now sees the verdict
+        proxy_pass http://main;
+    }
+}
+
+upstream main { server backend.example:80; }
+```
+
+Once `$host` is over its cap, `$over_host` is `"1"` at POST_READ and the rewrite-phase `if`
+fires (`444`). Under budget it is `""`, so the `if` is falsy and the request is proxied
+normally.
+
+### Example — content-phase `map` → `proxy_pass` still works
+
+The original lazy routing pattern works unchanged with `soft_limit_req_server` (the verdict
+is set early and survives into the content phase):
+
+```nginx
+soft_limit_req_zone $host zone=perhost:64m rate=12000r/s;
+
+map $over_host $pool {            # http{} only; read lazily at proxy_pass
+    "1"     grey_pool;
+    default main;
+}
+
+server {
+    listen 80;
+    server_name app.example;
+
+    soft_limit_req_server zone=perhost burst=2000 set=$over_host;  # POST_READ
+
+    location / {
+        proxy_pass http://$pool;   # main | grey_pool
+    }
+}
+
+upstream main      { server backend.example:80; }
+upstream grey_pool { server challenge.example:80; }   # sacrificial / challenge tier
+```
 
 ## Limitations & semantics
 
