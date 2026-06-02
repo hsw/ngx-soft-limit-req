@@ -92,6 +92,7 @@ static void ngx_http_soft_limit_req_expire(
     ngx_http_soft_limit_req_ctx_t *ctx, ngx_uint_t n);
 
 static ngx_int_t ngx_http_soft_limit_req_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r,
     ngx_array_t *limits, ngx_http_variable_value_t *seen);
 static ngx_int_t ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
@@ -288,6 +289,64 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      * is consumed (seen->valid set) only if a zone actually charged a bucket.
      */
     return ngx_http_soft_limit_req_run_limits(r, &slrcf->limits, seen);
+}
+
+
+static ngx_int_t
+ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *slrscf;
+
+    /*
+     * Server-scope handler, registered in the POST_READ phase so its set=$var
+     * verdict is written BEFORE the REWRITE phase and is therefore readable by
+     * rewrite-phase consumers (if / try_files / rewrite / early log), unlike the
+     * PREACCESS location-scope handler whose verdict only lands in time for the
+     * content phase.
+     *
+     * NO ONCE-PER-REQUEST MARKER IS NEEDED HERE (unlike the PREACCESS handler).
+     * The bucket is accounted EXACTLY ONCE per external request because POST_READ
+     * runs exactly once on the external request and NEVER re-runs on any internal
+     * re-entry. Verified against the pinned nginx source (nginx-1.31.1,
+     * src/http/ngx_http_core_module.c):
+     *
+     *   - POST_READ is phase index 0 and SERVER_REWRITE is the next phase
+     *     (ngx_http_core_module.h: NGX_HTTP_POST_READ_PHASE = 0, then
+     *     NGX_HTTP_SERVER_REWRITE_PHASE). Anything that rewinds r->phase_handler
+     *     to at/after server_rewrite_index re-enters AFTER POST_READ.
+     *   - try_files fallback, error_page, and X-Accel-Redirect all funnel through
+     *     ngx_http_internal_redirect() (line 2582), which calls ngx_http_handler()
+     *     (line 2630) with r->internal == 1; ngx_http_handler() then sets
+     *     r->phase_handler = cmcf->phase_engine.server_rewrite_index (line 868),
+     *     i.e. PAST POST_READ.
+     *   - ngx_http_named_location() (try_files -> @named, error_page -> @named;
+     *     line 2637) sets r->phase_handler = cmcf->phase_engine.location_rewrite_index
+     *     (line 2694) — later still, also past POST_READ.
+     *   - `rewrite ... last` does NOT call either redirect helper: it loops within
+     *     the phase engine via ngx_http_core_post_rewrite_phase() (line 1064),
+     *     which sets r->phase_handler = ph->next (line 1099) — the continuation
+     *     after the rewrite phases, never rewinding to POST_READ.
+     *   - Subrequests (auth_request / mirror / SSI) are excluded by the
+     *     r != r->main guard below: a helper request must neither tag nor account.
+     *
+     * Because no internal-redirect vector re-runs POST_READ and subrequests are
+     * declined, a single un-marked accounting pass cannot double-charge. We pass
+     * seen = NULL to ngx_http_soft_limit_req_run_limits() (no marker write). The
+     * verdict written into r->variables survives the redirect (neither redirect
+     * helper touches r->variables) and stays readable on the served request.
+     */
+
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
+
+    slrscf = ngx_http_get_module_srv_conf(r, ngx_http_soft_limit_req_module);
+
+    if (slrscf->limits.nelts == 0) {
+        return NGX_DECLINED;
+    }
+
+    return ngx_http_soft_limit_req_run_limits(r, &slrscf->limits, NULL);
 }
 
 
@@ -1245,6 +1304,19 @@ ngx_http_soft_limit_req_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_soft_limit_req_handler;
+
+    /*
+     * Server-scope handler in POST_READ: runs once per external request, before
+     * the REWRITE phase, so its verdict variable is visible to rewrite-phase
+     * directives. No once-per-request marker needed (see the handler comment for
+     * the verified-against-nginx-source no-double-charge invariant).
+     */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_soft_limit_req_server_handler;
 
     return NGX_OK;
 }
