@@ -55,6 +55,18 @@ typedef struct {
 } ngx_http_soft_limit_req_conf_t;
 
 
+/*
+ * Server-scope configuration for the soft_limit_req_server directive.
+ * Identical shape to the location conf (a single limits array, no flags):
+ * the only difference is the conf scope (NGX_HTTP_SRV_CONF_OFFSET) and the
+ * phase its handler runs in (POST_READ). Kept as a distinct type so the
+ * create/merge slots and handler reads are unambiguous.
+ */
+typedef struct {
+    ngx_array_t                       limits;
+} ngx_http_soft_limit_req_srv_conf_t;
+
+
 typedef struct {
     /*
      * Index into r->variables of an internal guard variable used as a
@@ -87,6 +99,9 @@ static ngx_int_t ngx_http_soft_limit_req_variable(ngx_http_request_t *r,
 static ngx_int_t ngx_http_soft_limit_req_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static void *ngx_http_soft_limit_req_create_main_conf(ngx_conf_t *cf);
+static void *ngx_http_soft_limit_req_create_srv_conf(ngx_conf_t *cf);
+static char *ngx_http_soft_limit_req_merge_srv_conf(ngx_conf_t *cf,
+    void *parent, void *child);
 static void *ngx_http_soft_limit_req_create_conf(ngx_conf_t *cf);
 static char *ngx_http_soft_limit_req_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -124,8 +139,8 @@ static ngx_http_module_t  ngx_http_soft_limit_req_module_ctx = {
     ngx_http_soft_limit_req_create_main_conf, /* create main configuration */
     NULL,                                  /* init main configuration */
 
-    NULL,                                  /* create server configuration */
-    NULL,                                  /* merge server configuration */
+    ngx_http_soft_limit_req_create_srv_conf, /* create server configuration */
+    ngx_http_soft_limit_req_merge_srv_conf,  /* merge server configuration */
 
     ngx_http_soft_limit_req_create_conf,   /* create location configuration */
     ngx_http_soft_limit_req_merge_conf     /* merge location configuration */
@@ -1030,6 +1045,48 @@ ngx_http_soft_limit_req_create_main_conf(ngx_conf_t *cf)
     conf->seen_index = NGX_CONF_UNSET;
 
     return conf;
+}
+
+
+static void *
+ngx_http_soft_limit_req_create_srv_conf(ngx_conf_t *cf)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool,
+                       sizeof(ngx_http_soft_limit_req_srv_conf_t));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    /*
+     * set by ngx_pcalloc():
+     *
+     *     conf->limits.elts = NULL;
+     */
+
+    return conf;
+}
+
+
+static char *
+ngx_http_soft_limit_req_merge_srv_conf(ngx_conf_t *cf, void *parent,
+    void *child)
+{
+    ngx_http_soft_limit_req_srv_conf_t  *prev = parent;
+    ngx_http_soft_limit_req_srv_conf_t  *conf = child;
+
+    /*
+     * http -> server inheritance (same elts == NULL idiom as the loc merge):
+     * a server that defines no soft_limit_req_server of its own inherits the
+     * http-level limits. Consequently an http{}-level soft_limit_req_server is
+     * inherited by ALL servers — this is intended (documented in README).
+     */
+    if (conf->limits.elts == NULL) {
+        conf->limits = prev->limits;
+    }
+
+    return NGX_CONF_OK;
 }
 
 
