@@ -117,8 +117,9 @@ soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http{} / server{}
 `soft_limit_req_server` runs the **same** leaky-bucket accounting against the **same**
 `soft_limit_req_zone` shared zones, but emits its verdict in the **POST_READ** phase —
 *before* the **REWRITE** phase. That makes `set=$var` readable by rewrite-phase directives
-(`if`, `try_files`, `rewrite`) and by an early `access_log`, not only by the lazy
-content-phase `map` → `proxy_pass` pattern.
+(`if`, `rewrite`, `set`), by precontent-phase `try_files`, and by an early `access_log` — not
+only by the lazy content-phase `map` → `proxy_pass` pattern. (All of these run after
+POST_READ, so the verdict is already set by the time they evaluate it.)
 
 This is the positive counterpart to the [`map`, not `if`](#caveat-use-map-not-if) caveat:
 the location-level `soft_limit_req` writes its verdict in PREACCESS, which runs *after* the
@@ -131,7 +132,7 @@ the verdict early enough for `if`/`return` to fire.
 |---|---|---|
 | phase | PREACCESS | POST_READ (earlier) |
 | scope | `server{}` / `location{}` | `http{}` / `server{}` (not `location{}`) |
-| verdict readable in | content phase (`map`) | rewrite phase (`if`/`try_files`/`rewrite`) **and** content phase |
+| verdict readable in | content phase (`map`) | rewrite phase (`if`/`rewrite`), precontent (`try_files`) **and** content phase |
 | per-location rates | yes | no — there is no matched location yet at POST_READ |
 
 Everything else is identical: it reuses the zones declared by `soft_limit_req_zone`, never
@@ -176,23 +177,28 @@ just becomes a no-op, which is easy to misread as "under budget".
      realip client IP. Keying a `soft_limit_req_server` zone on `$remote_addr` therefore
      silently corrupts logging, headers, maps, and downstream limiters for the entire request.
      This is action-at-a-distance and very hard to debug.
-  - **What to do instead:** for server-scope zones key on `$host` / `$http_*` (stable,
-    realip-independent, no poisoning). Per-real-client-IP limiting on `$remote_addr` is
-    reliable **only when `set_real_ip_from` / `real_ip_header` are configured at `http{}` or
-    `server{}` level** (global). At that scope realip's **POST_READ** pass rewrites the address
-    before *any* limiter reads it: realip's POST_READ handler resolves `r->loc_conf` to the
-    server's default location, finds `rlcf->from` set, and rewrites `$remote_addr` then — so by
-    the time our (or anyone's) limiter evaluates the key it is already the client IP, and the
-    cache is populated with the correct value. **If realip is configured only inside a
-    `location{}`**, even a location-level `soft_limit_req` is *not* safe: realip's POST_READ
-    pass sees no inherited config (`rlcf->from == NULL`, no location matched yet) and does
-    nothing, and realip only rewrites in its **PREACCESS** pass — but our PREACCESS handler is
-    pushed last and the phase engine flattens handlers in reverse push order, so our PREACCESS
-    handler runs **before** realip's. A location-level `soft_limit_req` keyed on `$remote_addr`
-    can therefore still read and cache the raw peer (same poisoning). (Test case `95` locks in
-    this ordering **and** exercises the poisoning side effect: it asserts that even by the
-    content phase `$remote_addr` reads the constant raw peer, because our POST_READ key eval
-    cached it.)
+  - **What to do instead:** for a server-scope `soft_limit_req_server` zone, key on `$host` /
+    `$http_*` (stable, realip-independent, no poisoning) — **never** `$remote_addr`, global
+    realip or not. Because this module's POST_READ handler runs *before* realip's POST_READ
+    pass (see above), a server-scope zone always reads the **raw peer** at POST_READ *and*
+    poisons `$remote_addr` for the rest of the request; configuring realip globally does **not**
+    change that. Per-real-client-IP limiting on `$remote_addr` belongs in a **PREACCESS /
+    location-level** limiter (location-level `soft_limit_req`, or stock `limit_req`), and even
+    there it is reliable **only when `set_real_ip_from` / `real_ip_header` are configured at
+    `http{}` or `server{}` level** (global). At that scope realip's **POST_READ** pass rewrites
+    the address before the *PREACCESS* limiter reads its key: realip's POST_READ handler
+    resolves `r->loc_conf` to the server's default location, finds `rlcf->from` set, and
+    rewrites `$remote_addr` then — so by the time a PREACCESS limiter evaluates the key it is
+    already the client IP, and the cache is populated with the correct value. **If realip is
+    configured only inside a `location{}`**, even a location-level `soft_limit_req` is *not*
+    safe: realip's POST_READ pass sees no inherited config (`rlcf->from == NULL`, no location
+    matched yet) and does nothing, and realip only rewrites in its **PREACCESS** pass — but our
+    PREACCESS handler is pushed last and the phase engine flattens handlers in reverse push
+    order, so our PREACCESS handler runs **before** realip's. A location-level `soft_limit_req`
+    keyed on `$remote_addr` can therefore still read and cache the raw peer (same poisoning).
+    (Test case `95` locks in this ordering **and** exercises the poisoning side effect: it
+    asserts that even by the content phase `$remote_addr` reads the constant raw peer, because
+    our POST_READ key eval cached it.)
 - **Resolves, but to the *early* value (usually not what you want):** `$uri`. nginx sets
   `r->uri` while parsing the request line, *before* POST_READ, so a `$uri`-keyed server zone
   does resolve — but it keys on the **pre-rewrite, normalized** URI (the original request
