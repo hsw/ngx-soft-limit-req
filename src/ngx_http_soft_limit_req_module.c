@@ -1018,7 +1018,7 @@ ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_array_t *limits)
 {
     ngx_int_t                         burst, set_index;
-    ngx_str_t                        *value, s, name;
+    ngx_str_t                        *value, s, name = ngx_null_string;
     ngx_uint_t                        i;
     ngx_shm_zone_t                   *shm_zone;
     ngx_http_variable_t              *var;
@@ -1152,6 +1152,34 @@ ngx_http_soft_limit_req_parse(ngx_conf_t *cf, ngx_command_t *cmd,
     for (i = 0; i < limits->nelts; i++) {
         if (shm_zone == elts[i].shm_zone) {
             return "is duplicate";
+        }
+
+        /*
+         * Reject two directives in this SAME conf array sharing one set=$var.
+         * At runtime run_limits() re-inits r->variables[set_index] to "" at the
+         * start of each zone's iteration, so a second directive would silently
+         * wipe the first's "1" verdict and the last array element would win --
+         * grey traffic leaks past detection with no config error. Fail fast at
+         * nginx -t instead. The boundary is deliberately the conf array (per-
+         * array set_index dedup): cross-directive sharing across SEPARATE arrays
+         * (soft_limit_req_server's srv-conf array vs soft_limit_req's loc-conf
+         * array) stays legal and is NOT rejected here. Such a pair CAN both run
+         * on one request -- soft_limit_req_server in POST_READ then location-level
+         * soft_limit_req in PREACCESS -- but that cross-phase overwrite is the
+         * documented last-writer-wins (PREACCESS wins; see README), a deliberate
+         * write of a fresh verdict, NOT the silent same-array wipe this check
+         * targets (two elements in one run_limits() loop, the later re-initing the
+         * shared slot to "" and clobbering the earlier zone's "1").
+         * The NGX_CONF_UNSET guard lets any number of
+         * directives without set= coexist; name is only valid (assigned in the
+         * set= branch) when set_index != NGX_CONF_UNSET.
+         */
+        if (set_index != NGX_CONF_UNSET && set_index == elts[i].set_index) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"set=$%V\" is already used by another "
+                               "\"%V\" directive in this scope",
+                               &name, &cmd->name);
+            return NGX_CONF_ERROR;
         }
     }
 

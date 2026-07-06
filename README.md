@@ -50,7 +50,11 @@ soft_limit_req_server zone=NAME [burst=N] [set=$var];   # http/server      (POST
   without writing a variable. For a `map`, `""` (and `"0"`) read as false. If the location
   has no `soft_limit_req` (handler never ran) the variable reads as not-found/empty.
 - Multiple `soft_limit_req` directives each write their **own** variable independently —
-  every zone is evaluated on every request (no break on the first overflow).
+  every zone is evaluated on every request (no break on the first overflow). Give each zone a
+  **distinct** `set=$var`: reusing the same `set=$var` across more than one directive in the
+  same configuration scope (two `soft_limit_req` in one `location` or one `server`, or two
+  `soft_limit_req_server` in one `server` or at `http` level) is rejected at `nginx -t` —
+  `"set=$var" is already used by another "..." directive in this scope`.
 
 > **Reserved name:** `$__soft_limit_req_seen` is an internal variable name reserved by this
 > module (it backs the redirect-surviving once-per-request accounting marker). Do **not**
@@ -221,6 +225,15 @@ location-level `soft_limit_req` overwrites it later in PREACCESS (last-writer-wi
 PREACCESS). In practice the two directives target separate zones and separate verdict
 variables, so this is an edge case, but it is worth stating: to read the *early* verdict in
 the rewrite phase, give `soft_limit_req_server` its own `set=$var`.
+
+This last-writer-wins behaviour applies **only** to the **cross-directive** case above — a
+`soft_limit_req_server` verdict in POST_READ overwritten by a location-level `soft_limit_req`
+in PREACCESS. Those two directives live in **separate** conf arrays (one server-scoped, one
+location-scoped), so sharing a `set=$var` between them stays legal. It is **not** how two
+directives of the *same* kind in the *same* scope behave: reusing one `set=$var` across two
+`soft_limit_req` (or two `soft_limit_req_server`) in the same array is a config error caught
+at `nginx -t` (`"set=$var" is already used by another "..." directive in this scope`), not
+last-writer-wins — see the [Directives](#directives) note above.
 
 Distinct from the verdict overwrite above: if both directives point at the **same zone**, that
 zone's bucket is charged **twice** per request — once in POST_READ by `soft_limit_req_server`
@@ -398,7 +411,8 @@ against pinned nginx, boots a container, and runs every `test/cases/*.sh`. Run:
 
 Checks: 5 harness checks (`.so` built, `nginx -t` syntax + module load, server up,
 `GET /` → 200) plus 18 behavior cases — zone + directive parsing (`10`, both
-`soft_limit_req_zone` and the `soft_limit_req` location directive), never-rejects under flood
+`soft_limit_req_zone` and the `soft_limit_req` location directive, including duplicate `set=`
+rejection within one `location`), never-rejects under flood
 with the verdict actually flipping to `1` (`20`), single + multi `set=$var` (`30`/`31`), stock
 IP hard-block coexisting with soft host routing via `map` plus the negative `if` phase-order
 assertion (`40`), shm-stability soak (`50`), empty-key verified-bypass (`60`), zone-full /
@@ -406,7 +420,8 @@ alloc-failure graceful degradation (`70`), and the internal-redirect accounting 
 same-zone re-entry counted once (`80`), redirect-target-only limiter accounts (`81`), and
 bypass-entry-then-redirect-target (`82`). The `soft_limit_req_server` (POST_READ) directive
 adds seven server-scope cases: `soft_limit_req_server` parse + scope acceptance, including
-rejection inside `location{}` (`11`); the headline verdict-visible-in-REWRITE proof via
+rejection inside `location{}` and duplicate `set=` rejection within one `server` (`11`); the
+headline verdict-visible-in-REWRITE proof via
 `if`→444 (`90`); single-charge across `try_files`/`error_page`/`rewrite ... last` re-entry
 (`91`); coexistence of both directives on separate zones with independent budgets (`92`); the
 key-readiness footgun encoded as an executable fact (an `$upstream_addr`-keyed zone whose
