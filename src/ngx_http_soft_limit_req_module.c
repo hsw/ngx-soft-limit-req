@@ -246,8 +246,13 @@ ngx_http_soft_limit_req_handler(ngx_http_request_t *r)
      * independently tag or account (it would write the verdict variable for an
      * internal helper request and skew the bucket), so we decline subrequests
      * outright and account only the main request. Note rewrite-last
-     * (`rewrite ... last`) does NOT set r->internal and is a single normal pass
-     * — it is accounted once, as it must be.
+     * (`rewrite ... last`) DOES set r->internal = 1 (any URI-changing rewrite
+     * runs ngx_http_script_regex_start_code with code->uri set) but calls
+     * neither redirect helper: post-rewrite rewinds the phase engine to
+     * FIND_CONFIG, which is before PREACCESS, so there is still a single
+     * PREACCESS pass and the request is accounted once, as it must be. (One
+     * more reason an r->internal gate would be wrong: it would skip that
+     * single pass too.)
      *
      * Because r == r->main below, r->variables IS r->main->variables. The first
      * accounting pass that does a real lookup sets seen->valid = 1 after running
@@ -302,8 +307,9 @@ ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
      * verdict is written BEFORE the REWRITE phase and is therefore readable by
      * rewrite-phase consumers (if / rewrite / early log) as well as the
      * precontent-phase try_files (the verdict stays readable because PRECONTENT
-     * runs after POST_READ), unlike the PREACCESS location-scope handler whose
-     * verdict only lands in time for the content phase.
+     * runs after POST_READ), unlike the PREACCESS location-scope handler,
+     * whose verdict is readable from the ACCESS phase onward (access,
+     * precontent/try_files, content, log) but not by rewrite-phase consumers.
      *
      * NO ONCE-PER-REQUEST MARKER IS NEEDED HERE (unlike the PREACCESS handler).
      * The bucket is accounted EXACTLY ONCE per external request because POST_READ
@@ -325,8 +331,10 @@ ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
      *     (line 2694) — later still, also past POST_READ.
      *   - `rewrite ... last` does NOT call either redirect helper: it loops within
      *     the phase engine via ngx_http_core_post_rewrite_phase() (line 1064),
-     *     which sets r->phase_handler = ph->next (line 1099) — the continuation
-     *     after the rewrite phases, never rewinding to POST_READ.
+     *     which sets r->phase_handler = ph->next (line 1099); for the
+     *     POST_REWRITE checker ph->next is find_config_index — a rewind to
+     *     FIND_CONFIG (re-runs location matching and the location rewrite
+     *     phase), still strictly after POST_READ.
      *   - Subrequests (auth_request / mirror / SSI) are excluded by the
      *     r != r->main guard below: a helper request must neither tag nor account.
      *
@@ -362,9 +370,13 @@ ngx_http_soft_limit_req_server_handler(ngx_http_request_t *r)
  *   - PREACCESS passes its redirect-surviving guard slot; it is consumed
  *     (seen->valid set) after the loop ONLY if at least one zone actually
  *     charged a bucket (lookup() returned NGX_OK / NGX_BUSY). On an all-bypass
- *     pass (every key empty / oversized) OR an all-degraded pass (every zone
- *     full -> NGX_ERROR, nothing charged) it stays unset, mirroring stock's
- *     limit_req_status, so a later internal-redirect target still accounts.
+ *     pass (every key empty / oversized) it stays unset, mirroring stock's
+ *     limit_req_status (stock lines 262-263). On an all-degraded pass (every
+ *     zone full -> NGX_ERROR, nothing charged) it also stays unset — a
+ *     DELIBERATE divergence from stock, which on NGX_ERROR sets
+ *     limit_req_status = REJECTED (or REJECTED_DRY_RUN) and rejects; nothing
+ *     was charged, so this never-reject fork keeps the once-per-request
+ *     budget. Either way a later internal-redirect target still accounts.
  *   - POST_READ passes NULL: it runs exactly once per external request and
  *     needs no marker (see the POST_READ handler comment).
  *
@@ -510,10 +522,12 @@ ngx_http_soft_limit_req_run_limits(ngx_http_request_t *r, ngx_array_t *limits,
     /*
      * Consume the once-per-request marker only if at least one zone actually
      * charged a bucket (lookup() returned NGX_OK / NGX_BUSY). On an all-bypass
-     * pass (every key empty or oversized) OR an all-degraded pass (every zone
-     * full -> NGX_ERROR, nothing charged) the marker stays unset, mirroring
-     * stock's limit_req_status, so a later internal-redirect target with a real
-     * limiter still accounts. A NULL seen (POST_READ) skips the marker entirely.
+     * pass (every key empty or oversized) the marker stays unset, mirroring
+     * stock's limit_req_status; on an all-degraded pass (every zone full ->
+     * NGX_ERROR, nothing charged) it stays unset as a deliberate divergence
+     * from stock (which sets limit_req_status and rejects on NGX_ERROR).
+     * Either way a later internal-redirect target with a real limiter still
+     * accounts. A NULL seen (POST_READ) skips the marker entirely.
      */
     if (seen != NULL && accounted) {
         seen->valid = 1;
