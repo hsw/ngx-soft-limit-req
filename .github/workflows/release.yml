@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Inlined actionlint (fast-fails the workflow YAML before the docker
       # build). Tag-push releases skip test.yml, so this is the release path's
@@ -87,7 +87,7 @@ jobs:
           apt-get install -y devscripts equivs ca-certificates curl gnupg sudo git
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install nginx mainline
         run: bash test/ci/install-nginx-mainline.sh
