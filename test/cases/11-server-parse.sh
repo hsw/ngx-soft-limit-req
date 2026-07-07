@@ -182,4 +182,43 @@ server {
 expect_ok "soft_limit_req_server coexists with soft_limit_req (separate zones)" \
     "$WORK/srv-coexist.conf"
 
+# --- invalid: two soft_limit_req_server sharing one set= in one server{} ----
+# The srv branch of the shared parser must reject the same set=$var collision:
+# two directives on DIFFERENT zones but one set=$over silently wipe each other's
+# verdict at runtime. Built with write_conf (two zones) -- write_srv_conf's
+# single hardcoded zone "h" cannot express it.
+write_conf "$WORK/srv-dup-set.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    soft_limit_req_server zone=a burst=10 set=\$over;
+    soft_limit_req_server zone=b burst=10 set=\$over;
+    location / { return 200 ok; }
+}"
+expect_fail "soft_limit_req_server duplicate set= in one server{}" \
+    "$WORK/srv-dup-set.conf" \
+    'set=\$over.*already used by another.*soft_limit_req_server'
+
+# --- valid: soft_limit_req_server + location soft_limit_req share one set= ---
+# Cross-directive sharing lives in SEPARATE conf arrays (srv vs loc). Both DO run
+# on one request -- soft_limit_req_server in POST_READ, then soft_limit_req in
+# PREACCESS -- and PREACCESS overwrites the shared verdict (documented last-writer-
+# wins, see README). That cross-phase overwrite is intended, so the same set=$over
+# across the boundary stays legal -- the per-array reject must not reach across it.
+# (Sits beside srv-coexist above, which shares the parser but uses distinct vars.)
+write_conf "$WORK/srv-loc-shared-set.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    soft_limit_req_server zone=a burst=10 set=\$over;
+    location / {
+        soft_limit_req zone=b burst=10 set=\$over;
+        return 200 ok;
+    }
+}"
+expect_ok "soft_limit_req_server + soft_limit_req share set= (separate arrays)" \
+    "$WORK/srv-loc-shared-set.conf"
+
 finish

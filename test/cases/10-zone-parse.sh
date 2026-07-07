@@ -216,4 +216,93 @@ write_loc_conf "$WORK/loc-undef-zone.conf" \
 expect_fail "soft_limit_req referencing an undefined zone" \
     "$WORK/loc-undef-zone.conf" 'zero size shared memory zone'
 
+# --- invalid: two directives in one location sharing one set=$var ----------
+# Two soft_limit_req on DIFFERENT zones (a, b) but the SAME set=$over in one
+# location silently wipe each other's verdict at runtime; the parser must
+# reject the collision. Built with write_conf (two zones) because write_loc_conf
+# hardcodes a single zone "h" and cannot express this.
+write_conf "$WORK/loc-dup-set.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    location / {
+        soft_limit_req zone=a burst=10 set=\$over;
+        soft_limit_req zone=b burst=10 set=\$over;
+    }
+}"
+expect_fail "soft_limit_req duplicate set= in one location" \
+    "$WORK/loc-dup-set.conf" \
+    'set=\$over.*already used by another.*soft_limit_req'
+
+# --- invalid: mixed-case set= aliases the same variable index --------------
+# nginx variable names are case-insensitive, so set=$over and set=$OVER map to
+# one index and collide just like the exact-match case above.
+write_conf "$WORK/loc-dup-set-mixedcase.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    location / {
+        soft_limit_req zone=a burst=10 set=\$over;
+        soft_limit_req zone=b burst=10 set=\$OVER;
+    }
+}"
+# The reject message prints the raw config token (&name points into cf->args, not
+# a lowercased copy), so the last-writer set=$OVER renders verbatim as set=$OVER;
+# the regex uses a case-insensitive character class to match either rendering robustly.
+expect_fail "soft_limit_req duplicate set= (mixed case)" \
+    "$WORK/loc-dup-set-mixedcase.conf" \
+    'set=\$[oO][vV][eE][rR].*already used by another.*soft_limit_req'
+
+# --- valid: two zones with DIFFERENT set= variables ------------------------
+# Guards against an over-greedy reject: distinct variables must stay legal.
+write_conf "$WORK/loc-distinct-set.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    location / {
+        soft_limit_req zone=a burst=10 set=\$over_a;
+        soft_limit_req zone=b burst=10 set=\$over_b;
+    }
+}"
+expect_ok "soft_limit_req distinct set= variables (two zones)" \
+    "$WORK/loc-distinct-set.conf"
+
+# --- valid: two zones, neither has set= (NGX_CONF_UNSET guard) --------------
+# Directives without set= carry set_index == NGX_CONF_UNSET; the guard must let
+# any number of them coexist without matching each other.
+write_conf "$WORK/loc-no-set.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    location / {
+        soft_limit_req zone=a burst=10;
+        soft_limit_req zone=b burst=10;
+    }
+}"
+expect_ok "soft_limit_req two directives without set= (two zones)" \
+    "$WORK/loc-no-set.conf"
+
+# --- valid: same set=$var at server{} vs location{} (separate arrays) -------
+# A server-level soft_limit_req and a location-level one live in SEPARATE conf
+# arrays and the location fully overrides the inherited set via merge, so they
+# never run together. Sharing set=$over across that boundary is legal -- the
+# per-array reject must not reach across it.
+write_conf "$WORK/loc-srv-vs-loc.conf" \
+"soft_limit_req_zone \$host zone=a:10m rate=100r/s;
+soft_limit_req_zone \$host zone=b:10m rate=100r/s;
+server {
+    listen 80;
+    soft_limit_req zone=a burst=10 set=\$over;
+    location / {
+        soft_limit_req zone=b burst=10 set=\$over;
+        return 200 ok;
+    }
+}"
+expect_ok "soft_limit_req same set= across server/location (separate arrays)" \
+    "$WORK/loc-srv-vs-loc.conf"
+
 finish
